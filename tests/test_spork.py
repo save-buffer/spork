@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 import spork as sk
@@ -255,3 +257,91 @@ def test_matmul_mpp():
     )
 
     np.testing.assert_allclose(C, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_sigmoid():
+    """
+    Exercises math intrinsics (sk.exp) by computing 1 / (1 + exp(-x)).
+    """
+    shape = (4096,)
+    A = np.random.randn(*shape).astype(np.float32)
+    C = np.zeros(shape, dtype=np.float32)
+
+    expected = 1.0 / (1.0 + np.exp(-A))
+
+    @sk.jit
+    def sigmoid(
+        out : sk.DevicePointer[sk.dt.float32],
+        A   : sk.DevicePointer[sk.dt.float32],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        out[i] = 1.0 / (1.0 + sk.exp(-A[i]))
+
+    sigmoid[
+        (shape[0] // 128, 1, 1),
+        (128, 1, 1),
+    ](C, A)
+
+    np.testing.assert_allclose(C, expected, atol=1e-5, rtol=1e-5)
+
+
+def test_histogram():
+    """
+    Each thread reads one value from `values`, computes its bin, and bumps
+    the bin counter with sk.atomic_fetch_add on a `device atomic_uint *`.
+    """
+    N = 4096
+    NBINS = 16
+
+    np.random.seed(0)
+    values = np.random.randint(0, NBINS * 4, size=N).astype(np.uint32)
+    counts = np.zeros(NBINS, dtype=np.uint32)
+
+    expected = np.bincount(values % NBINS, minlength=NBINS).astype(np.uint32)
+
+    @sk.jit
+    def histogram(
+        counts : sk.DevicePointer[sk.dt.atomic_uint32],
+        values : sk.DevicePointer[sk.dt.uint32],
+        nbins  : sk.Uint,
+        gid    : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        val = values[gid]
+        bin_idx = val % nbins
+        sk.atomic_fetch_add(counts, bin_idx, 1)
+
+    histogram[
+        (N // 128, 1, 1),
+        (128, 1, 1),
+    ](counts, values, NBINS)
+
+    np.testing.assert_array_equal(counts, expected)
+
+
+def test_profile_smoke():
+    """
+    Smoke test for sk.profile. Only runs when MTL_CAPTURE_ENABLED=1 is set in
+    the environment — Metal refuses to start a capture otherwise.
+    """
+    if os.environ.get("MTL_CAPTURE_ENABLED") != "1":
+        return
+
+    shape = (1024,)
+    A = np.random.randn(*shape).astype(np.float32)
+    B = np.random.randn(*shape).astype(np.float32)
+    C = np.zeros(shape, dtype=np.float32)
+
+    @sk.jit
+    def add(
+        out : sk.DevicePointer[sk.dt.float32],
+        A   : sk.DevicePointer[sk.dt.float32],
+        B   : sk.DevicePointer[sk.dt.float32],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        out[i] = A[i] + B[i]
+
+    with sk.profile(name="test_profile_smoke", open_in_xcode=False) as path:
+        add[(shape[0] // 32, 1, 1), (32, 1, 1)](C, A, B)
+
+    assert os.path.exists(path)
+    np.testing.assert_allclose(C, A + B)

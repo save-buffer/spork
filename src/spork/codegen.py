@@ -52,6 +52,8 @@ def format_expr(expr : ir.Expr, parent_prec : int = 0) -> str:
         return s
     if isinstance(expr, ir.UnaryOp):
         return f"{expr.op}{format_expr(expr.operand, 11)}"
+    if isinstance(expr, ir.AddrOf):
+        return f"&{format_expr(expr.operand, 11)}"
     if isinstance(expr, ir.Cast):
         return f"static_cast<{expr.dtype.metal}>({format_expr(expr.operand, 0)})"
     if isinstance(expr, ir.Call):

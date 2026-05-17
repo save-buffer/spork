@@ -24,6 +24,29 @@ int64 = Dtype("int64", "long", 8)
 uint64 = Dtype("uint64", "ulong", 8, is_signed=False)
 bool_ = Dtype("bool", "bool", 1, is_signed=False)
 
+# Atomic dtypes — pointers declared with these emit `device atomic_T *`.
+# Memory layout matches the underlying type, so numpy args are passed as
+# the underlying dtype (uint32 / int32 / float32).
+atomic_uint32  = Dtype("atomic_uint32",  "atomic_uint",  4, is_signed=False)
+atomic_int32   = Dtype("atomic_int32",   "atomic_int",   4)
+atomic_float32 = Dtype("atomic_float32", "atomic_float", 4, is_float=True)
+
+
+_ATOMIC_UNDERLYING = {
+    atomic_uint32  : uint32,
+    atomic_int32   : int32,
+    atomic_float32 : float32,
+}
+
+
+def underlying(d : "Dtype") -> "Dtype":
+    """
+    Return the non-atomic dtype that an atomic dtype shares memory layout with.
+
+    For non-atomic dtypes, returns the input unchanged.
+    """
+    return _ATOMIC_UNDERLYING.get(d, d)
+
 
 _NUMPY_TO_DTYPE = {
     np.dtype(np.float32): float32,

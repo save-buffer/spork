@@ -2711,8 +2711,8 @@ wheels = [
 ]
 
 [[package]]
-name = "spork"
-version = "0.1.0"
+name = "spork-metal"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "numpy" },

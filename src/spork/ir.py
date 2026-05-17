@@ -49,6 +49,16 @@ class UnaryOp(Expr):
 
 
 @dataclass
+class AddrOf(Expr):
+    """
+    Address-of expression: ``&<expr>``. Needed for passing element addresses
+    to Metal's atomic_* intrinsics.
+    """
+
+    operand : Expr
+
+
+@dataclass
 class Cast(Expr):
     dtype   : dt.Dtype
     operand : Expr

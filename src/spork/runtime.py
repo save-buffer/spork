@@ -91,7 +91,7 @@ def _expect_pointer_arg(arr, param : ir.Param) -> np.ndarray:
             f"Argument for pointer parameter '{param.name}' must be a numpy array, "
             f"got {type(arr).__name__}"
         )
-    expected = param.dtype
+    expected = dt.underlying(param.dtype)
     actual = dt.from_numpy(arr.dtype)
     if actual != expected:
         raise TypeError(

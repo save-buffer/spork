@@ -1,8 +1,20 @@
+import contextlib
 import contextvars
+import os
+import subprocess
+from tempfile import mkdtemp
 from typing import Dict, List, Optional
+
+from Foundation import NSURL
+from Metal import (
+    MTLCaptureDescriptor,
+    MTLCaptureDestinationGPUTraceDocument,
+    MTLCaptureManager,
+)
 
 from . import dtypes as dt
 from . import ir
+from . import runtime
 
 
 _builder : contextvars.ContextVar[Optional["KernelBuilder"]] = contextvars.ContextVar(
@@ -785,3 +797,231 @@ def matmul2d(
         metal_type=f"matmul2d<{desc_name}, execution_simdgroups<{simdgroups}>>",
     ))
     return MatmulOp(op_name, m, n, k, builder)
+
+
+# ---------------------------------------------------------------------------
+# Math intrinsics + cast
+# ---------------------------------------------------------------------------
+
+
+def _math_call(func : str, *args, result_dtype : Optional[dt.Dtype] = None) -> Tracer:
+    """
+    Pure-expression intrinsic — emits ``func(args...)`` without materializing.
+    Result dtype defaults to the first arg's dtype.
+    """
+    arg_exprs = [_to_expr(a) for a in args]
+    if result_dtype is None:
+        first = args[0]
+        result_dtype = first._dtype if isinstance(first, Tracer) else None
+    return Tracer(ir.Call(func, arg_exprs), result_dtype)
+
+
+# Unary float math
+def exp(x)   : return _math_call("exp", x)
+def exp2(x)  : return _math_call("exp2", x)
+def log(x)   : return _math_call("log", x)
+def log2(x)  : return _math_call("log2", x)
+def log10(x) : return _math_call("log10", x)
+def sqrt(x)  : return _math_call("sqrt", x)
+def rsqrt(x) : return _math_call("rsqrt", x)
+def sin(x)   : return _math_call("sin", x)
+def cos(x)   : return _math_call("cos", x)
+def tan(x)   : return _math_call("tan", x)
+def asin(x)  : return _math_call("asin", x)
+def acos(x)  : return _math_call("acos", x)
+def atan(x)  : return _math_call("atan", x)
+def sinh(x)  : return _math_call("sinh", x)
+def cosh(x)  : return _math_call("cosh", x)
+def tanh(x)  : return _math_call("tanh", x)
+def floor(x) : return _math_call("floor", x)
+def ceil(x)  : return _math_call("ceil", x)
+def round(x) : return _math_call("round", x)
+def trunc(x) : return _math_call("trunc", x)
+def fabs(x)  : return _math_call("fabs", x)
+def abs(x)   : return _math_call("abs", x)
+def sign(x)  : return _math_call("sign", x)
+
+# Two-arg
+def pow(x, y)   : return _math_call("pow", x, y)
+def fmod(x, y)  : return _math_call("fmod", x, y)
+def atan2(y, x) : return _math_call("atan2", y, x)
+def fmin(x, y)  : return _math_call("fmin", x, y)
+def fmax(x, y)  : return _math_call("fmax", x, y)
+def min(x, y)   : return _math_call("min", x, y)
+def max(x, y)   : return _math_call("max", x, y)
+
+# Three-arg
+def clamp(x, lo, hi) : return _math_call("clamp", x, lo, hi)
+def fma(a, b, c)     : return _math_call("fma", a, b, c)
+
+# Fast (approximate, lower-precision) variants — Metal's metal::fast:: namespace
+def fast_exp(x)   : return _math_call("fast::exp", x)
+def fast_log(x)   : return _math_call("fast::log", x)
+def fast_log2(x)  : return _math_call("fast::log2", x)
+def fast_sqrt(x)  : return _math_call("fast::sqrt", x)
+def fast_rsqrt(x) : return _math_call("fast::rsqrt", x)
+def fast_sin(x)   : return _math_call("fast::sin", x)
+def fast_cos(x)   : return _math_call("fast::cos", x)
+def fast_tan(x)   : return _math_call("fast::tan", x)
+def fast_pow(x, y): return _math_call("fast::pow", x, y)
+
+
+def cast(value, dtype : dt.Dtype) -> Tracer:
+    """
+    Emit ``static_cast<dtype>(value)``.
+    """
+    return Tracer(ir.Cast(dtype, _to_expr(value)), dtype)
+
+
+# ---------------------------------------------------------------------------
+# Atomic operations
+# ---------------------------------------------------------------------------
+
+
+_VALID_MEM_ORDERS = {"relaxed"}  # Metal currently only exposes memory_order_relaxed
+
+
+def _mem_order(order : str) -> ir.Raw:
+    if order not in _VALID_MEM_ORDERS:
+        raise ValueError(
+            f"Unknown memory order {order!r}; expected one of {sorted(_VALID_MEM_ORDERS)}"
+        )
+    return ir.Raw(f"memory_order_{order}")
+
+
+def _atomic_addr(ptr : PointerTracer, idx) -> ir.AddrOf:
+    if not isinstance(ptr, PointerTracer):
+        raise TypeError(
+            "atomic operations expect a sk.DevicePointer (typically with an "
+            "atomic dtype), got %r" % (type(ptr).__name__,)
+        )
+    return ir.AddrOf(ir.Load(ptr._expr, _to_expr(idx)))
+
+
+def _mark_pointer_written(ptr : PointerTracer) -> None:
+    if isinstance(ptr._expr, ir.Var):
+        builder = current_builder()
+        for p in builder.params:
+            if p.kind == "pointer" and p.name == ptr._expr.name:
+                p.written = True
+                break
+
+
+def _atomic_rmw(func : str, ptr : PointerTracer, idx, value, order : str) -> Tracer:
+    """
+    Atomic read-modify-write. Always emits a local that captures the prior
+    value, so the side effect happens even if the caller ignores the result.
+    """
+    builder = current_builder()
+    order_expr = _mem_order(order)
+    addr = _atomic_addr(ptr, idx)
+    val_expr = _to_expr(value)
+    call = ir.Call(func, [addr, val_expr, order_expr])
+    underlying = dt.underlying(ptr._dtype) if ptr._dtype is not None else None
+    metal_type = underlying.metal if underlying is not None else "auto"
+    name = builder.fresh_name("atom")
+    builder.add_stmt(ir.Assign(name, metal_type, call))
+    _mark_pointer_written(ptr)
+    return Tracer(ir.Var(name), underlying)
+
+
+def atomic_load(ptr : PointerTracer, idx, order : str = "relaxed") -> Tracer:
+    """
+    Atomically load ``ptr[idx]``.
+    """
+    builder = current_builder()
+    addr = _atomic_addr(ptr, idx)
+    call = ir.Call("atomic_load_explicit", [addr, _mem_order(order)])
+    underlying = dt.underlying(ptr._dtype) if ptr._dtype is not None else None
+    metal_type = underlying.metal if underlying is not None else "auto"
+    name = builder.fresh_name("atomload")
+    builder.add_stmt(ir.Assign(name, metal_type, call))
+    return Tracer(ir.Var(name), underlying)
+
+
+def atomic_store(ptr : PointerTracer, idx, value, order : str = "relaxed") -> None:
+    """
+    Atomically store ``value`` into ``ptr[idx]``.
+    """
+    addr = _atomic_addr(ptr, idx)
+    call = ir.Call("atomic_store_explicit", [addr, _to_expr(value), _mem_order(order)])
+    current_builder().add_stmt(ir.ExprStmt(call))
+    _mark_pointer_written(ptr)
+
+
+def atomic_fetch_add(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_add_explicit", ptr, idx, value, order)
+
+
+def atomic_fetch_sub(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_sub_explicit", ptr, idx, value, order)
+
+
+def atomic_fetch_and(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_and_explicit", ptr, idx, value, order)
+
+
+def atomic_fetch_or(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_or_explicit", ptr, idx, value, order)
+
+
+def atomic_fetch_xor(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_xor_explicit", ptr, idx, value, order)
+
+
+def atomic_fetch_min(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_min_explicit", ptr, idx, value, order)
+
+
+def atomic_fetch_max(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_fetch_max_explicit", ptr, idx, value, order)
+
+
+def atomic_exchange(ptr, idx, value, order : str = "relaxed") -> Tracer:
+    return _atomic_rmw("atomic_exchange_explicit", ptr, idx, value, order)
+
+
+# ---------------------------------------------------------------------------
+# GPU trace capture (profiler)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def profile(name : str = "spork_trace", open_in_xcode : bool = True):
+    """
+    Capture all GPU work submitted inside the ``with`` block to a
+    ``.gputrace`` document, then optionally open it in Xcode.
+
+    Requires the environment variable ``MTL_CAPTURE_ENABLED=1`` to be set
+    before launching Python; otherwise Metal refuses to start a capture.
+
+    Usage::
+
+        with sk.profile():
+            matmul[(g, 1, 1), (32, 1, 1)](C, A, B)
+    """
+    queue = runtime.get_command_queue()
+    manager = MTLCaptureManager.sharedCaptureManager()
+    if not manager.supportsDestination_(MTLCaptureDestinationGPUTraceDocument):
+        raise RuntimeError(
+            "GPU trace capture is not enabled. Set MTL_CAPTURE_ENABLED=1 in "
+            "the environment before launching Python."
+        )
+
+    trace_path = os.path.join(mkdtemp(), f"{name}.gputrace")
+    trace_url = NSURL.fileURLWithPath_(trace_path)
+    desc = MTLCaptureDescriptor()
+    desc.setCaptureObject_(queue)
+    desc.setDestination_(MTLCaptureDestinationGPUTraceDocument)
+    desc.setOutputURL_(trace_url)
+
+    _, error = manager.startCaptureWithDescriptor_error_(desc, None)
+    if error:
+        raise RuntimeError(f"Failed to start capture: {error.localizedDescription()}")
+
+    try:
+        yield trace_path
+    finally:
+        manager.stopCapture()
+        if open_in_xcode:
+            subprocess.run(["open", trace_path])
