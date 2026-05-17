@@ -1,6 +1,6 @@
 [project]
 name = "spork-metal"
-version = "0.3.0"
+version = "0.4.0"
 description = "A tracing Python DSL for writing Metal compute kernels for Apple GPUs."
 readme = "README.md"
 license = { file = "LICENSE.md" }
