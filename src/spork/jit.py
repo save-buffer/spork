@@ -48,6 +48,7 @@ class JittedKernel:
         self._sig = inspect.signature(fn)
         self._builder : Optional[KernelBuilder] = None
         self._source : Optional[str] = None
+        self._source_map : Optional[dict] = None
         self._pipeline = None
 
     def _trace(self) -> KernelBuilder:
@@ -100,8 +101,8 @@ class JittedKernel:
         if self._pipeline is not None:
             return
         self._builder = self._trace()
-        self._source = emit_kernel(self._builder)
-        library = runtime.compile_source(self._source)
+        self._source, self._source_map = emit_kernel(self._builder)
+        library = runtime.compile_source(self._source, source_map=self._source_map)
         self._pipeline = runtime.make_pipeline(library, self.name)
 
     def __getitem__(self, dispatch_spec) -> "_Launcher":
@@ -117,8 +118,18 @@ class JittedKernel:
     def metal_source(self) -> str:
         if self._source is None:
             self._builder = self._trace()
-            self._source = emit_kernel(self._builder)
+            self._source, self._source_map = emit_kernel(self._builder)
         return self._source
+
+    @property
+    def source_map(self) -> Optional[dict]:
+        """
+        Mapping of generated-Metal line number (1-indexed) to a
+        ``(python_filename, python_lineno)`` tuple.
+        """
+        if self._source is None:
+            _ = self.metal_source
+        return self._source_map
 
 
 class _Launcher:

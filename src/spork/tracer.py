@@ -3,6 +3,7 @@ import contextvars
 import inspect
 import os
 import subprocess
+import sys
 from tempfile import mkdtemp
 from typing import Callable, Dict, List, Optional
 
@@ -17,6 +18,26 @@ from . import dtypes as dt
 from . import ir
 from . import runtime
 from .types import DevicePointerSpec
+
+
+_SPORK_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _caller_loc() -> Optional[tuple]:
+    """
+    Walk up the call stack and return the (filename, lineno) of the first
+    frame that lives *outside* the spork package directory.
+
+    Returns None if the entire stack is internal (e.g. invoked from a REPL
+    with code that's hard to attribute).
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        fname = frame.f_code.co_filename
+        if not fname.startswith(_SPORK_PACKAGE_DIR):
+            return (fname, frame.f_lineno)
+        frame = frame.f_back
+    return None
 
 
 _builder : contextvars.ContextVar[Optional["KernelBuilder"]] = contextvars.ContextVar(
@@ -45,6 +66,8 @@ class KernelBuilder:
         self._name_counters : Dict[str, int] = {}
 
     def add_stmt(self, stmt : ir.Stmt) -> None:
+        if getattr(stmt, "loc", None) is None:
+            stmt.loc = _caller_loc()
         self.stmts.append(stmt)
 
     def fresh_name(self, prefix : str = "v") -> str:

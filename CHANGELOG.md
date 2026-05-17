@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Source-mapped compile errors.** Every emitted IR statement now records
+  the Python `(filename, lineno)` of the call site that produced it (via a
+  stack-walk that skips spork's own frames). Codegen builds a per-line source
+  map alongside the generated Metal source, and `runtime.compile_source`
+  uses it to prepend a header to Metal compile errors that translates each
+  referenced `program_source:LINE` to the originating Python location.
+- **`JittedKernel.source_map`** property — exposes the mapping for
+  introspection (line in generated Metal → `(python_filename, python_lineno)`).
+
+### Changed
+
+- `codegen.emit_kernel` now returns `(source, source_map)` instead of just
+  `source`. Internal API only; the user-facing `JittedKernel.metal_source`
+  property is unchanged.
+- `runtime.compile_source` accepts an optional `source_map` keyword argument
+  used to rewrite compile errors.
+
 
 ## [0.3.0] — 2026-05-16
 

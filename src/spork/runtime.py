@@ -1,4 +1,5 @@
-from typing import List, Sequence
+import re
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import objc
@@ -14,6 +15,45 @@ from Metal import (
 
 from . import dtypes as dt
 from . import ir
+
+
+_METAL_ERROR_LINE_RE = re.compile(r"program_source:(\d+):(\d+)")
+
+
+def _rewrite_compile_error(
+    metal_error_text : str,
+    source_map : Optional[Dict[int, Tuple[str, int]]],
+) -> str:
+    """
+    Find ``program_source:LINE:COL`` references in a Metal compiler error
+    message and prepend a header that translates each referenced line to the
+    Python source location where the offending IR was emitted.
+
+    If ``source_map`` is None or no referenced lines are in the map, returns
+    the input unchanged.
+    """
+    if not source_map:
+        return metal_error_text
+
+    seen : Dict[int, Tuple[str, int]] = {}
+    for match in _METAL_ERROR_LINE_RE.finditer(metal_error_text):
+        line = int(match.group(1))
+        if line in source_map and line not in seen:
+            seen[line] = source_map[line]
+
+    if not seen:
+        return metal_error_text
+
+    mapping_lines = [
+        f"  generated line {ln} → {fname}:{lineno}"
+        for ln, (fname, lineno) in sorted(seen.items())
+    ]
+    header = (
+        "Python source locations for reported generated lines:\n"
+        + "\n".join(mapping_lines)
+        + "\n\n"
+    )
+    return header + metal_error_text
 
 
 # PyObjC lacks metadata for MTL4 APIs — register the error: param as an
@@ -50,7 +90,11 @@ def get_command_queue():
     return _command_queue
 
 
-def compile_source(source : str, enable_logging : bool = False):
+def compile_source(
+    source         : str,
+    enable_logging : bool = False,
+    source_map     : Optional[Dict[int, Tuple[str, int]]] = None,
+):
     device = get_device()
 
     options = MTLCompileOptions()
@@ -68,8 +112,9 @@ def compile_source(source : str, enable_logging : bool = False):
 
     library, error = compiler.newLibraryWithDescriptor_error_(lib_desc, None)
     if error:
+        metal_msg = _rewrite_compile_error(error.localizedDescription(), source_map)
         raise RuntimeError(
-            f"Failed to compile kernel:\n{error.localizedDescription()}\n\nSource:\n{source}"
+            f"Failed to compile kernel:\n{metal_msg}\n\nSource:\n{source}"
         )
     return library
 

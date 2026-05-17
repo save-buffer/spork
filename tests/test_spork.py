@@ -387,3 +387,57 @@ def test_device_fn_and_control_flow():
     sqrt_kernel[(N // 128, 1, 1), (128, 1, 1)](C, A)
 
     np.testing.assert_allclose(C, expected, atol=1e-4, rtol=1e-4)
+
+
+def test_source_map_captures_user_locs():
+    """
+    Verify the JittedKernel's source_map points generated-Metal lines back at
+    the originating Python source locations.
+    """
+    THIS_FILE = __file__
+
+    @sk.jit
+    def add_two(
+        out : sk.DevicePointer[sk.dt.float32],
+        A   : sk.DevicePointer[sk.dt.float32],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        x = A[i] + 1.0
+        out[i] = x + 1.0  # this line should appear in source_map
+
+    smap = add_two.source_map
+    assert smap is not None and len(smap) > 0, "source_map should be populated"
+    # All mapped locations should point at this test file
+    files = {loc[0] for loc in smap.values()}
+    assert files == {THIS_FILE}, (
+        f"Expected all source_map entries to point at {THIS_FILE}, got {files}"
+    )
+
+
+def test_compile_error_rewriter():
+    """
+    Unit test for the regex-based compile-error rewriter — confirms it injects
+    a Python source location header when Metal references a mapped line.
+    """
+    from spork.runtime import _rewrite_compile_error
+
+    metal_error = (
+        "program_source:7:23: error: use of undeclared identifier 'foo'\n"
+        "    out[i] = foo + 1;\n"
+        "              ^\n"
+    )
+    rewritten = _rewrite_compile_error(metal_error, {7: ("/path/user.py", 42)})
+    assert "Python source locations" in rewritten
+    assert "user.py:42" in rewritten
+    assert "generated line 7" in rewritten
+    # Original error must still be present
+    assert "use of undeclared identifier" in rewritten
+
+    # No map → passthrough
+    assert _rewrite_compile_error(metal_error, None) == metal_error
+    assert _rewrite_compile_error(metal_error, {}) == metal_error
+
+    # Map entries that aren't referenced → passthrough
+    assert (
+        _rewrite_compile_error(metal_error, {99: ("/x.py", 1)}) == metal_error
+    )

@@ -1,7 +1,12 @@
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
 from . import ir
 from .tracer import KernelBuilder
+
+
+# Per-line source map: maps an output line (1-indexed) to a Python source
+# location (filename, lineno).
+SourceMap = Dict[int, Tuple[str, int]]
 
 
 _PREC = {
@@ -86,98 +91,144 @@ def _format_for_step(var_name : str, step : ir.Expr) -> str:
     return f"{var_name} += {format_expr(step, 0)}"
 
 
-def format_stmt(stmt : ir.Stmt, indent : int = 4) -> str:
+def _line_count(text : str) -> int:
+    """Number of lines in ``text`` (1 for a string with no newlines)."""
+    return text.count("\n") + 1
+
+
+def format_stmt(stmt : ir.Stmt, indent : int = 4) -> Tuple[str, Dict[int, tuple]]:
+    """
+    Format a statement.
+
+    Returns (text, locs) where ``locs`` maps a 0-indexed line within ``text``
+    to a Python source location.
+    """
     pad = " " * indent
+    self_loc = getattr(stmt, "loc", None)
+    locs : Dict[int, tuple] = {}
+    if self_loc:
+        locs[0] = self_loc
+
     if isinstance(stmt, ir.Store):
-        return (
+        text = (
             f"{pad}{format_expr(stmt.ptr, 100)}[{format_expr(stmt.index, 0)}] = "
             f"{format_expr(stmt.value, 0)};"
         )
+        return text, locs
     if isinstance(stmt, ir.Assign):
-        return f"{pad}{stmt.metal_type} {stmt.name} = {format_expr(stmt.value, 0)};"
+        return f"{pad}{stmt.metal_type} {stmt.name} = {format_expr(stmt.value, 0)};", locs
     if isinstance(stmt, ir.Update):
-        return f"{pad}{stmt.name} {stmt.op} {format_expr(stmt.value, 0)};"
-    if isinstance(stmt, ir.ForLoop):
-        body_lines = format_stmts(stmt.body, indent + 4)
-        body = body_lines if body_lines else f"{pad}    // empty"
-        return (
-            f"{pad}for (uint {stmt.var_name} = {format_expr(stmt.start, 0)}; "
-            f"{stmt.var_name} < {format_expr(stmt.end, 0)}; "
-            f"{_format_for_step(stmt.var_name, stmt.step)})\n"
-            f"{pad}{{\n"
-            f"{body}\n"
-            f"{pad}}}"
-        )
-    if isinstance(stmt, ir.IfStmt):
-        then_lines = format_stmts(stmt.then_body, indent + 4)
-        then_body = then_lines if then_lines else f"{pad}    // empty"
-        result = (
-            f"{pad}if ({format_expr(stmt.cond, 0)})\n"
-            f"{pad}{{\n"
-            f"{then_body}\n"
-            f"{pad}}}"
-        )
-        if stmt.else_body is not None:
-            else_lines = format_stmts(stmt.else_body, indent + 4)
-            else_body = else_lines if else_lines else f"{pad}    // empty"
-            result += (
-                f"\n{pad}else\n"
-                f"{pad}{{\n"
-                f"{else_body}\n"
-                f"{pad}}}"
-            )
-        return result
+        return f"{pad}{stmt.name} {stmt.op} {format_expr(stmt.value, 0)};", locs
     if isinstance(stmt, ir.ExprStmt):
-        return f"{pad}{format_expr(stmt.expr, 0)};"
+        return f"{pad}{format_expr(stmt.expr, 0)};", locs
     if isinstance(stmt, ir.ThreadgroupDecl):
         dims = "".join(f"[{d}]" for d in stmt.shape)
-        return f"{pad}threadgroup {stmt.metal_type} {stmt.name}{dims};"
+        return f"{pad}threadgroup {stmt.metal_type} {stmt.name}{dims};", locs
     if isinstance(stmt, ir.DefaultDecl):
-        return f"{pad}{stmt.metal_type} {stmt.name};"
+        return f"{pad}{stmt.metal_type} {stmt.name};", locs
     if isinstance(stmt, ir.ConstructorDecl):
         args = ", ".join(format_expr(a, 0) for a in stmt.args)
-        return f"{pad}{stmt.metal_type} {stmt.name}({args});"
-    if isinstance(stmt, ir.WhileLoop):
-        body_lines = format_stmts(stmt.body, indent + 4)
-        body = body_lines if body_lines else f"{pad}    // empty"
-        return (
-            f"{pad}while ({format_expr(stmt.cond, 0)})\n"
-            f"{pad}{{\n"
-            f"{body}\n"
-            f"{pad}}}"
-        )
+        return f"{pad}{stmt.metal_type} {stmt.name}({args});", locs
     if isinstance(stmt, ir.Break):
-        return f"{pad}break;"
+        return f"{pad}break;", locs
     if isinstance(stmt, ir.Continue):
-        return f"{pad}continue;"
+        return f"{pad}continue;", locs
     if isinstance(stmt, ir.Return):
         if stmt.value is None:
-            return f"{pad}return;"
-        return f"{pad}return {format_expr(stmt.value, 0)};"
+            return f"{pad}return;", locs
+        return f"{pad}return {format_expr(stmt.value, 0)};", locs
+
+    if isinstance(stmt, ir.ForLoop):
+        header = (
+            f"{pad}for (uint {stmt.var_name} = {format_expr(stmt.start, 0)}; "
+            f"{stmt.var_name} < {format_expr(stmt.end, 0)}; "
+            f"{_format_for_step(stmt.var_name, stmt.step)})"
+        )
+        body_text, body_locs = format_stmts(stmt.body, indent + 4)
+        if not body_text:
+            body_text = f"{pad}    // empty"
+        text = f"{header}\n{pad}{{\n{body_text}\n{pad}}}"
+        # body starts on line index 2 (header=0, "{"=1, body=2+)
+        for rl, loc in body_locs.items():
+            locs[2 + rl] = loc
+        return text, locs
+
+    if isinstance(stmt, ir.WhileLoop):
+        header = f"{pad}while ({format_expr(stmt.cond, 0)})"
+        body_text, body_locs = format_stmts(stmt.body, indent + 4)
+        if not body_text:
+            body_text = f"{pad}    // empty"
+        text = f"{header}\n{pad}{{\n{body_text}\n{pad}}}"
+        for rl, loc in body_locs.items():
+            locs[2 + rl] = loc
+        return text, locs
+
+    if isinstance(stmt, ir.IfStmt):
+        header = f"{pad}if ({format_expr(stmt.cond, 0)})"
+        then_text, then_locs = format_stmts(stmt.then_body, indent + 4)
+        if not then_text:
+            then_text = f"{pad}    // empty"
+        text = f"{header}\n{pad}{{\n{then_text}\n{pad}}}"
+        for rl, loc in then_locs.items():
+            locs[2 + rl] = loc
+        if stmt.else_body is not None:
+            then_lines = _line_count(text)
+            else_text, else_locs = format_stmts(stmt.else_body, indent + 4)
+            if not else_text:
+                else_text = f"{pad}    // empty"
+            text += f"\n{pad}else\n{pad}{{\n{else_text}\n{pad}}}"
+            # else body starts at: then_lines (close brace was at then_lines - 1)
+            # + 1 (else line) + 1 (open brace) = then_lines + 2
+            else_offset = then_lines + 2
+            for rl, loc in else_locs.items():
+                locs[else_offset + rl] = loc
+        return text, locs
+
     raise TypeError(f"Unknown statement node: {type(stmt).__name__}")
 
 
-def emit_device_fn(df) -> str:
+def format_stmts(stmts : List[ir.Stmt], indent : int = 4) -> Tuple[str, Dict[int, tuple]]:
+    """
+    Format a list of statements.
+
+    Returns (text, locs) where ``locs`` maps a 0-indexed line within ``text``
+    to a Python source location.
+    """
+    if not stmts:
+        return "", {}
+    parts = []
+    locs : Dict[int, tuple] = {}
+    current_line = 0
+    for stmt in stmts:
+        text, sub_locs = format_stmt(stmt, indent)
+        parts.append(text)
+        for rl, loc in sub_locs.items():
+            locs[current_line + rl] = loc
+        current_line += _line_count(text)
+    return "\n".join(parts), locs
+
+
+def emit_device_fn(df) -> Tuple[str, Dict[int, tuple]]:
     """
     Emit a complete device-function definition in Allman style.
+
+    Returns (text, locs) with locs keyed by line index within the device-fn
+    text (0 = signature line).
     """
     params_block = ", ".join(df._param_strs)
-    body = format_stmts(df._stmts, indent=4)
-    if not body:
-        body = "    // empty"
-    return (
-        f"{df._return_type} {df._name}({params_block})\n"
-        "{\n"
-        f"{body}\n"
-        "}\n"
-    )
+    body_text, body_locs = format_stmts(df._stmts, indent=4)
+    if not body_text:
+        body_text = "    // empty"
+    sig_line = f"{df._return_type} {df._name}({params_block})"
+    text = f"{sig_line}\n{{\n{body_text}\n}}"
+    # body starts at line 2 (sig=0, "{"=1, body=2+)
+    locs : Dict[int, tuple] = {}
+    for rl, loc in body_locs.items():
+        locs[2 + rl] = loc
+    return text, locs
 
 
-def format_stmts(stmts : List[ir.Stmt], indent : int = 4) -> str:
-    return "\n".join(format_stmt(s, indent) for s in stmts)
-
-
-def _format_param(p : ir.Param, buffer_idx : int) -> tuple[str, int]:
+def _format_param(p : ir.Param, buffer_idx : int) -> Tuple[str, int]:
     if p.kind == "pointer":
         return (
             f"    device {p.dtype.metal} *{p.name} [[buffer({buffer_idx})]]",
@@ -197,40 +248,69 @@ def _format_param(p : ir.Param, buffer_idx : int) -> tuple[str, int]:
     raise ValueError(f"Unknown param kind: {p.kind}")
 
 
-def emit_kernel(builder : KernelBuilder) -> str:
-    param_lines = []
+def emit_kernel(builder : KernelBuilder) -> Tuple[str, SourceMap]:
+    """
+    Render the full Metal source for a kernel.
+
+    Returns ``(source, source_map)`` where ``source_map`` maps a 1-indexed
+    output line in ``source`` to a ``(python_filename, python_lineno)`` tuple,
+    for any line that was emitted with a tracked source location.
+    """
+    lines : List[str] = []
+    source_map : SourceMap = {}
+
+    def add_line(text : str, loc : Optional[tuple] = None) -> None:
+        lines.append(text)
+        if loc:
+            source_map[len(lines)] = loc
+
+    def add_block(text : str, locs : Dict[int, tuple]) -> None:
+        start = len(lines) + 1  # 1-indexed line of the first line we're adding
+        for ln in text.rstrip("\n").split("\n"):
+            lines.append(ln)
+        for rl, loc in locs.items():
+            source_map[start + rl] = loc
+
+    # Includes
+    for path, system in builder.includes:
+        add_line(f"#include <{path}>" if system else f'#include "{path}"')
+    add_line("")
+
+    # Usings
+    for ns in builder.usings:
+        add_line(f"using namespace {ns};")
+    add_line("")
+
+    # Device functions
+    for df in builder.device_functions:
+        df_text, df_locs = emit_device_fn(df)
+        add_block(df_text, df_locs)
+        add_line("")
+
+    # Kernel signature
+    param_lines : List[str] = []
     buffer_idx = 0
     for p in builder.params:
         line, buffer_idx = _format_param(p, buffer_idx)
         param_lines.append(line)
 
-    params_block = ",\n".join(param_lines)
-    body = format_stmts(builder.stmts, indent=4)
-    if not body:
-        body = "    // empty kernel"
+    add_line(f"kernel void {builder.name}(")
+    if param_lines:
+        for line in param_lines[:-1]:
+            add_line(line + ",")
+        add_line(param_lines[-1] + ")")
+    else:
+        add_line(")")
+    add_line("{")
 
-    include_lines = "\n".join(
-        f"#include <{path}>" if system else f'#include "{path}"'
-        for path, system in builder.includes
-    )
-    using_lines = "\n".join(f"using namespace {ns};" for ns in builder.usings)
+    # Kernel body
+    body_text, body_locs = format_stmts(builder.stmts, indent=4)
+    if body_text:
+        add_block(body_text, body_locs)
+    else:
+        add_line("    // empty kernel")
 
-    device_fn_block = ""
-    if builder.device_functions:
-        device_fn_block = (
-            "\n".join(emit_device_fn(df) for df in builder.device_functions)
-            + "\n"
-        )
+    add_line("}")
 
-    return (
-        f"{include_lines}\n"
-        "\n"
-        f"{using_lines}\n"
-        "\n"
-        f"{device_fn_block}"
-        f"kernel void {builder.name}(\n"
-        f"{params_block})\n"
-        "{\n"
-        f"{body}\n"
-        "}\n"
-    )
+    source = "\n".join(lines) + "\n"
+    return source, source_map
