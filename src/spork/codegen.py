@@ -50,6 +50,11 @@ def format_expr(expr : ir.Expr, parent_prec : int = 0) -> str:
         return f"{expr.op}{format_expr(expr.operand, 11)}"
     if isinstance(expr, ir.Cast):
         return f"static_cast<{expr.dtype.metal}>({format_expr(expr.operand, 0)})"
+    if isinstance(expr, ir.Call):
+        args = ", ".join(format_expr(a, 0) for a in expr.args)
+        return f"{expr.func}({args})"
+    if isinstance(expr, ir.Raw):
+        return expr.text
     raise TypeError(f"Unknown expression node: {type(expr).__name__}")
 
 
@@ -83,6 +88,30 @@ def format_stmt(stmt : ir.Stmt, indent : int = 4) -> str:
             f"{body}\n"
             f"{pad}}}"
         )
+    if isinstance(stmt, ir.IfStmt):
+        then_lines = format_stmts(stmt.then_body, indent + 4)
+        then_body = then_lines if then_lines else f"{pad}    // empty"
+        result = (
+            f"{pad}if ({format_expr(stmt.cond, 0)})\n"
+            f"{pad}{{\n"
+            f"{then_body}\n"
+            f"{pad}}}"
+        )
+        if stmt.else_body is not None:
+            else_lines = format_stmts(stmt.else_body, indent + 4)
+            else_body = else_lines if else_lines else f"{pad}    // empty"
+            result += (
+                f"\n{pad}else\n"
+                f"{pad}{{\n"
+                f"{else_body}\n"
+                f"{pad}}}"
+            )
+        return result
+    if isinstance(stmt, ir.ExprStmt):
+        return f"{pad}{format_expr(stmt.expr, 0)};"
+    if isinstance(stmt, ir.ThreadgroupDecl):
+        dims = "".join(f"[{d}]" for d in stmt.shape)
+        return f"{pad}threadgroup {stmt.metal_type} {stmt.name}{dims};"
     raise TypeError(f"Unknown statement node: {type(stmt).__name__}")
 
 

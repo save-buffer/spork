@@ -54,6 +54,28 @@ class Cast(Expr):
     operand : Expr
 
 
+@dataclass
+class Call(Expr):
+    """
+    A function-call expression: ``func(arg0, arg1, ...)``.
+    """
+
+    func : str
+    args : List["Expr"] = field(default_factory=list)
+
+
+@dataclass
+class Raw(Expr):
+    """
+    A verbatim chunk of Metal source embedded as an expression.
+
+    Useful for things like ``mem_flags::mem_threadgroup`` that don't deserve
+    their own IR node.
+    """
+
+    text : str
+
+
 class Stmt:
     pass
 
@@ -98,6 +120,41 @@ class ForLoop(Stmt):
     end      : Expr
     step     : Expr
     body     : List[Stmt] = field(default_factory=list)
+
+
+@dataclass
+class IfStmt(Stmt):
+    """
+    An ``if (cond) { ... } else { ... }`` statement; ``else_body`` may be None.
+    """
+
+    cond      : Expr
+    then_body : List[Stmt] = field(default_factory=list)
+    else_body : Optional[List[Stmt]] = None
+
+
+@dataclass
+class ExprStmt(Stmt):
+    """
+    A statement whose effect is just evaluating an expression
+    (typically a Call): ``<expr>;``.
+    """
+
+    expr : Expr
+
+
+@dataclass
+class ThreadgroupDecl(Stmt):
+    """
+    A threadgroup memory array declaration:
+    ``threadgroup <metal_type> <name>[D0][D1]...;``.
+
+    All dimensions must be Python ints (Metal requires constexpr sizes).
+    """
+
+    name       : str
+    metal_type : str
+    shape      : List[int]
 
 
 @dataclass

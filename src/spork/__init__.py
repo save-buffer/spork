@@ -1,6 +1,31 @@
 from . import dtypes as dt
 from .jit import JittedKernel, jit
-from .tracer import local, range
+from .tracer import (
+    if_,
+    local,
+    range,
+    simd_all,
+    simd_and,
+    simd_any,
+    simd_broadcast,
+    simd_max,
+    simd_min,
+    simd_or,
+    simd_prefix_exclusive_product,
+    simd_prefix_exclusive_sum,
+    simd_prefix_inclusive_product,
+    simd_prefix_inclusive_sum,
+    simd_product,
+    simd_shuffle,
+    simd_shuffle_down,
+    simd_shuffle_up,
+    simd_shuffle_xor,
+    simd_sum,
+    simd_xor,
+    simdgroup_barrier,
+    threadgroup,
+    threadgroup_barrier,
+)
 from .types import (
     DevicePointer,
     Int,
@@ -25,12 +50,26 @@ __all__ = [
     "dt",
     "jit",
     "JittedKernel",
+    # Kernel-level control flow + memory
     "local",
     "range",
+    "if_",
+    "threadgroup",
+    "threadgroup_barrier",
+    "simdgroup_barrier",
+    # Simd intrinsics
+    "simd_sum", "simd_product", "simd_max", "simd_min",
+    "simd_and", "simd_or", "simd_xor", "simd_all", "simd_any",
+    "simd_prefix_inclusive_sum", "simd_prefix_exclusive_sum",
+    "simd_prefix_inclusive_product", "simd_prefix_exclusive_product",
+    "simd_broadcast", "simd_shuffle", "simd_shuffle_up",
+    "simd_shuffle_down", "simd_shuffle_xor",
+    # Parameter type specs
     "DevicePointer",
     "ScalarParamSpec",
     "Uint", "Uint2", "Uint3",
     "Int", "Int2", "Int3",
+    # Attribute markers
     "ThreadAttribute",
     "ThreadPositionInGrid",
     "ThreadPositionInThreadgroup",

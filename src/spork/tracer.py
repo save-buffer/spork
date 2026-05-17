@@ -286,3 +286,194 @@ class _RangeLoop:
                 step=self._step,
                 body=body,
             ))
+
+
+class ThreadgroupArray:
+    """
+    A threadgroup-memory array. Supports both single-axis and tuple subscripts:
+
+        a[i]        # 1-D
+        a[i, j]     # 2-D, sugar for a[i][j]
+        a[i, j, k]  # 3-D, ...
+    """
+
+    __slots__ = ("_name", "_dtype", "_shape", "_builder", "_expr")
+
+    def __init__(
+        self,
+        name    : str,
+        dtype   : dt.Dtype,
+        shape   : tuple,
+        builder : KernelBuilder,
+    ):
+        self._name = name
+        self._dtype = dtype
+        self._shape = shape
+        self._builder = builder
+        self._expr = ir.Var(name)
+
+    def _indices(self, index):
+        if isinstance(index, tuple):
+            return tuple(_to_expr(i) for i in index)
+        return (_to_expr(index),)
+
+    def __getitem__(self, index) -> Tracer:
+        indices = self._indices(index)
+        expr : ir.Expr = self._expr
+        for idx in indices:
+            expr = ir.Load(expr, idx)
+        return Tracer(expr, self._dtype)
+
+    def __setitem__(self, index, value) -> None:
+        indices = self._indices(index)
+        *outer, last = indices
+        ptr_expr : ir.Expr = self._expr
+        for idx in outer:
+            ptr_expr = ir.Load(ptr_expr, idx)
+        self._builder.add_stmt(ir.Store(ptr_expr, last, _to_expr(value)))
+
+
+def threadgroup(dtype : dt.Dtype, shape) -> ThreadgroupArray:
+    """
+    Declare a threadgroup-memory array of the given fixed shape.
+
+    Shape elements must be Python ints (Metal requires constexpr sizes).
+    """
+    builder = current_builder()
+    if isinstance(shape, int):
+        shape = (shape,)
+    else:
+        shape = tuple(shape)
+    for d in shape:
+        if not isinstance(d, int) or d <= 0:
+            raise TypeError(
+                f"threadgroup array shape must be positive Python ints, got {shape!r}"
+            )
+    name = builder.fresh_name("s")
+    builder.add_stmt(ir.ThreadgroupDecl(
+        name=name,
+        metal_type=dtype.metal,
+        shape=list(shape),
+    ))
+    return ThreadgroupArray(name, dtype, shape, builder)
+
+
+_VALID_MEM_SCOPES = {"none", "device", "threadgroup", "threadgroup_imageblock", "texture"}
+
+
+def _barrier(func : str, scopes : tuple) -> None:
+    if not scopes:
+        scopes = ("threadgroup",)
+    for s in scopes:
+        if s not in _VALID_MEM_SCOPES:
+            raise ValueError(
+                f"Unknown memory scope {s!r}; expected one of {sorted(_VALID_MEM_SCOPES)}"
+            )
+    flag_text = " | ".join(f"mem_flags::mem_{s}" for s in scopes)
+    builder = current_builder()
+    builder.add_stmt(ir.ExprStmt(ir.Call(func, [ir.Raw(flag_text)])))
+
+
+def threadgroup_barrier(*scopes : str) -> None:
+    """
+    Emit ``threadgroup_barrier(mem_flags::mem_<scope> | ...)``.
+
+    Defaults to ``mem_threadgroup`` when no scopes are given.
+    """
+    _barrier("threadgroup_barrier", scopes)
+
+
+def simdgroup_barrier(*scopes : str) -> None:
+    """
+    Emit ``simdgroup_barrier(mem_flags::mem_<scope> | ...)``.
+
+    Defaults to ``mem_threadgroup`` when no scopes are given.
+    """
+    _barrier("simdgroup_barrier", scopes)
+
+
+def _simd_op(func : str, *args, result_dtype : Optional[dt.Dtype] = None) -> Tracer:
+    """
+    Emit a simd collective as ``<T> simdN = func(args...);`` at the current
+    statement position.
+
+    Collectives must be called by every lane in the simdgroup. Materializing
+    the result into a local prevents subsequent uses (e.g. inside an ``if``
+    block) from re-inlining the call and accidentally putting the collective
+    in divergent control flow.
+    """
+    builder = current_builder()
+    arg_exprs = [_to_expr(a) for a in args]
+    if result_dtype is not None:
+        dtype = result_dtype
+    else:
+        first = args[0]
+        dtype = first._dtype if isinstance(first, Tracer) else None
+        if dtype is None:
+            dtype = dt.float32
+    name = builder.fresh_name("simd")
+    builder.add_stmt(ir.Assign(name, dtype.metal, ir.Call(func, arg_exprs)))
+    return Tracer(ir.Var(name), dtype)
+
+
+def simd_sum(x) -> Tracer:     return _simd_op("simd_sum", x)
+def simd_product(x) -> Tracer: return _simd_op("simd_product", x)
+def simd_max(x) -> Tracer:     return _simd_op("simd_max", x)
+def simd_min(x) -> Tracer:     return _simd_op("simd_min", x)
+def simd_and(x) -> Tracer:     return _simd_op("simd_and", x)
+def simd_or(x) -> Tracer:      return _simd_op("simd_or", x)
+def simd_xor(x) -> Tracer:     return _simd_op("simd_xor", x)
+def simd_all(x) -> Tracer:     return _simd_op("simd_all", x, result_dtype=dt.bool_)
+def simd_any(x) -> Tracer:     return _simd_op("simd_any", x, result_dtype=dt.bool_)
+def simd_prefix_inclusive_sum(x) -> Tracer:     return _simd_op("simd_prefix_inclusive_sum", x)
+def simd_prefix_exclusive_sum(x) -> Tracer:     return _simd_op("simd_prefix_exclusive_sum", x)
+def simd_prefix_inclusive_product(x) -> Tracer: return _simd_op("simd_prefix_inclusive_product", x)
+def simd_prefix_exclusive_product(x) -> Tracer: return _simd_op("simd_prefix_exclusive_product", x)
+
+def simd_broadcast(x, lane) -> Tracer:    return _simd_op("simd_broadcast", x, lane)
+def simd_shuffle(x, lane) -> Tracer:      return _simd_op("simd_shuffle", x, lane)
+def simd_shuffle_up(x, delta) -> Tracer:  return _simd_op("simd_shuffle_up", x, delta)
+def simd_shuffle_down(x, delta) -> Tracer:return _simd_op("simd_shuffle_down", x, delta)
+def simd_shuffle_xor(x, mask) -> Tracer:  return _simd_op("simd_shuffle_xor", x, mask)
+
+
+class _IfBlock:
+    """
+    Context manager produced by ``sk.if_(cond)``.
+
+    On enter, swaps in a fresh statement list so any kernel statements emitted
+    inside the ``with`` block become the if-body. On exit, restores the outer
+    statement list and appends an IfStmt.
+    """
+
+    __slots__ = ("_cond", "_builder", "_saved")
+
+    def __init__(self, cond : ir.Expr):
+        self._cond = cond
+        self._builder : Optional[KernelBuilder] = None
+        self._saved = None
+
+    def __enter__(self):
+        builder = current_builder()
+        self._builder = builder
+        self._saved = builder.stmts
+        builder.stmts = []
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        body = self._builder.stmts
+        self._builder.stmts = self._saved
+        self._builder.add_stmt(ir.IfStmt(cond=self._cond, then_body=body, else_body=None))
+        return False
+
+
+def if_(cond) -> _IfBlock:
+    """
+    Emit an ``if (cond) { ... }`` block.
+
+    Usage:
+
+        with sk.if_(thread_idx == 0):
+            out[i] = total
+    """
+    return _IfBlock(_to_expr(cond))
