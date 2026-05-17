@@ -1,0 +1,22 @@
+[project]
+name = "spork"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Sasha Krassovsky", email = "krassovskysasha@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.0",
+    "pyobjc>=11.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.9"]
+build-backend = "uv_build"
