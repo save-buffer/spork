@@ -516,20 +516,22 @@ class TensorHandle(_OpaqueHandle):
     with compile-time extents.
     """
 
-    __slots__ = ("_name", "_dtype", "_shape", "_builder", "_expr")
+    __slots__ = ("_name", "_dtype", "_shape", "_builder", "_expr", "_source_pointer_name")
 
     def __init__(
         self,
-        name    : str,
-        dtype   : dt.Dtype,
-        shape   : tuple,
-        builder : KernelBuilder,
+        name                 : str,
+        dtype                : dt.Dtype,
+        shape                : tuple,
+        builder              : KernelBuilder,
+        source_pointer_name  : Optional[str] = None,
     ):
         self._name = name
         self._dtype = dtype
         self._shape = shape
         self._builder = builder
         self._expr = ir.Var(name)
+        self._source_pointer_name = source_pointer_name
 
     def slice(self, tile_shape, offsets) -> "TileSlice":
         """
@@ -557,27 +559,33 @@ class TensorHandle(_OpaqueHandle):
             args=offset_exprs,
         )
         self._builder.add_stmt(ir.Assign(tile_name, "auto", method))
-        return TileSlice(ir.Var(tile_name), self._dtype, tile_shape, self._builder)
+        return TileSlice(ir.Var(tile_name), self._dtype, tile_shape, self._builder, source_tensor=self)
 
 
 class TileSlice(_OpaqueHandle):
     """
     An opaque handle to a tile produced by ``TensorHandle.slice``.
+
+    Remembers the source TensorHandle so that downstream writes (e.g.
+    ``coop.store(tile)``) can mark the underlying pointer parameter as
+    written and trigger a buffer copy-back after dispatch.
     """
 
-    __slots__ = ("_expr", "_dtype", "_shape", "_builder")
+    __slots__ = ("_expr", "_dtype", "_shape", "_builder", "_source_tensor")
 
     def __init__(
         self,
-        expr    : ir.Expr,
-        dtype   : dt.Dtype,
-        shape   : tuple,
-        builder : KernelBuilder,
+        expr           : ir.Expr,
+        dtype          : dt.Dtype,
+        shape          : tuple,
+        builder        : KernelBuilder,
+        source_tensor  : Optional["TensorHandle"] = None,
     ):
         self._expr = expr
         self._dtype = dtype
         self._shape = shape
         self._builder = builder
+        self._source_tensor = source_tensor
 
 
 def tensor(ptr : PointerTracer, dtype : dt.Dtype, shape) -> TensorHandle:
@@ -620,7 +628,8 @@ def tensor(ptr : PointerTracer, dtype : dt.Dtype, shape) -> TensorHandle:
         metal_type="tensor",
         args=[ptr._expr, ir.Var(extents_name)],
     ))
-    return TensorHandle(tensor_name, dtype, shape, builder)
+    source_name = ptr._expr.name if isinstance(ptr._expr, ir.Var) else None
+    return TensorHandle(tensor_name, dtype, shape, builder, source_pointer_name=source_name)
 
 
 _MATMUL2D_MODES = {
@@ -706,7 +715,18 @@ class CooperativeTensor(_OpaqueHandle):
     def store(self, tile : TileSlice) -> None:
         """
         Emit ``self.store(tile);``.
+
+        If the tile slices a tensor that wraps a kernel pointer parameter,
+        mark that parameter as written so the runtime copies the buffer back
+        into the user's numpy array after dispatch.
         """
+        if isinstance(tile, TileSlice) and tile._source_tensor is not None:
+            ptr_name = tile._source_tensor._source_pointer_name
+            if ptr_name is not None:
+                for p in self._builder.params:
+                    if p.kind == "pointer" and p.name == ptr_name:
+                        p.written = True
+                        break
         call = ir.MethodCall(
             obj=ir.Var(self._name),
             method="store",
