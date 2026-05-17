@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import Optional, Type, Union
+from dataclasses import dataclass, field
+from typing import List, Optional, Type, Union
 
 from . import dtypes as dt
 from .types import ThreadAttribute
@@ -23,6 +23,16 @@ class Const(Expr):
 class Load(Expr):
     ptr   : Expr
     index : Expr
+
+
+@dataclass
+class Member(Expr):
+    """
+    Access a field on a vector or struct expression, e.g. ``gid.x``.
+    """
+
+    operand : Expr
+    field   : str
 
 
 @dataclass
@@ -67,10 +77,35 @@ class Assign(Stmt):
 
 
 @dataclass
+class Update(Stmt):
+    """
+    Re-assign an existing local: ``name <op>= <expr>;`` (op may be ``=``).
+    """
+
+    name  : str
+    op    : str
+    value : Expr
+
+
+@dataclass
+class ForLoop(Stmt):
+    """
+    A ``for (uint i = start; i < end; i += step) { ... }`` loop.
+    """
+
+    var_name : str
+    start    : Expr
+    end      : Expr
+    step     : Expr
+    body     : List[Stmt] = field(default_factory=list)
+
+
+@dataclass
 class Param:
     name       : str
     kind       : str
     dtype      : dt.Dtype
     metal_name : Optional[str] = None
+    vec_size   : int = 1
     attribute  : Optional[Type[ThreadAttribute]] = None
     written    : bool = False

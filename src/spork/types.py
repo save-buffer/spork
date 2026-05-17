@@ -59,7 +59,7 @@ class DevicePointerSpec:
 @dataclass(frozen=True)
 class ScalarParamSpec:
     """
-    A scalar parameter spec.
+    A scalar (or vector) parameter spec.
 
     If ``attribute`` is set, the parameter is filled by the Metal runtime
     (e.g. thread_position_in_grid). Otherwise it is a ``constant T &`` buffer
@@ -68,7 +68,22 @@ class ScalarParamSpec:
 
     dtype      : dt.Dtype
     metal_name : str
+    vec_size   : int = 1
     attribute  : Optional[Type[ThreadAttribute]] = None
+
+
+class _ScalarTypeBase:
+    """
+    Marker base for the bare scalar type classes (Uint, Uint2, ...).
+
+    Subscripting a subclass with a ThreadAttribute produces a ScalarParamSpec
+    attribute parameter; using the class bare in an annotation produces a
+    constant parameter (the conversion happens in jit.py).
+    """
+
+    _dtype      : dt.Dtype
+    _metal_name : str
+    _vec_size   : int = 1
 
 
 class _DevicePointer:
@@ -83,10 +98,11 @@ class _DevicePointer:
 DevicePointer = _DevicePointer
 
 
-def _scalar_factory(dtype : dt.Dtype, metal_name : str):
-    class _ScalarType:
+def _scalar_factory(dtype : dt.Dtype, metal_name : str, vec_size : int = 1):
+    class _ScalarType(_ScalarTypeBase):
         _dtype      = dtype
         _metal_name = metal_name
+        _vec_size   = vec_size
 
         def __class_getitem__(cls, attribute):
             if not (isinstance(attribute, type) and issubclass(attribute, ThreadAttribute)):
@@ -97,6 +113,7 @@ def _scalar_factory(dtype : dt.Dtype, metal_name : str):
             return ScalarParamSpec(
                 dtype=cls._dtype,
                 metal_name=cls._metal_name,
+                vec_size=cls._vec_size,
                 attribute=attribute,
             )
 
@@ -104,9 +121,9 @@ def _scalar_factory(dtype : dt.Dtype, metal_name : str):
     return _ScalarType
 
 
-Uint  = _scalar_factory(dt.uint32, "uint")
-Uint2 = _scalar_factory(dt.uint32, "uint2")
-Uint3 = _scalar_factory(dt.uint32, "uint3")
-Int   = _scalar_factory(dt.int32, "int")
-Int2  = _scalar_factory(dt.int32, "int2")
-Int3  = _scalar_factory(dt.int32, "int3")
+Uint  = _scalar_factory(dt.uint32, "uint",  1)
+Uint2 = _scalar_factory(dt.uint32, "uint2", 2)
+Uint3 = _scalar_factory(dt.uint32, "uint3", 3)
+Int   = _scalar_factory(dt.int32,  "int",   1)
+Int2  = _scalar_factory(dt.int32,  "int2",  2)
+Int3  = _scalar_factory(dt.int32,  "int3",  3)

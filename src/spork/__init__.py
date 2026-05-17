@@ -1,5 +1,6 @@
 from . import dtypes as dt
 from .jit import JittedKernel, jit
+from .tracer import local, range
 from .types import (
     DevicePointer,
     Int,
@@ -24,6 +25,8 @@ __all__ = [
     "dt",
     "jit",
     "JittedKernel",
+    "local",
+    "range",
     "DevicePointer",
     "ScalarParamSpec",
     "Uint", "Uint2", "Uint3",

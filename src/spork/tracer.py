@@ -1,5 +1,5 @@
 import contextvars
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import dtypes as dt
 from . import ir
@@ -24,14 +24,24 @@ class KernelBuilder:
         self.name : str = name
         self.params : List[ir.Param] = []
         self.stmts : List[ir.Stmt] = []
+        self._name_counters : Dict[str, int] = {}
 
     def add_stmt(self, stmt : ir.Stmt) -> None:
         self.stmts.append(stmt)
+
+    def fresh_name(self, prefix : str = "v") -> str:
+        n = self._name_counters.get(prefix, 0)
+        self._name_counters[prefix] = n + 1
+        return f"{prefix}{n}"
 
 
 def _to_expr(value) -> ir.Expr:
     if isinstance(value, Tracer):
         return value._expr
+    if isinstance(value, VectorTracer):
+        raise TypeError(
+            "Cannot use a vector value as a scalar — access a field like .x first"
+        )
     if isinstance(value, PointerTracer):
         raise TypeError("Cannot use a pointer as a scalar value")
     if isinstance(value, bool):
@@ -143,3 +153,136 @@ class PointerTracer:
                 if p.kind == "pointer" and p.name == self._expr.name:
                     p.written = True
                     break
+
+
+class VectorTracer:
+    """
+    Represents a vector-typed value (uint2/uint3/int2/...) in a traced kernel.
+
+    Component access (``v.x``, ``v.y``, ``v.z``, ``v.w``) yields a scalar Tracer.
+    """
+
+    __slots__ = ("_expr", "_dtype", "_vec_size")
+
+    _FIELDS = ("x", "y", "z", "w")
+
+    def __init__(self, expr : ir.Expr, elem_dtype : dt.Dtype, vec_size : int):
+        self._expr = expr
+        self._dtype = elem_dtype
+        self._vec_size = vec_size
+
+    def __getattr__(self, name : str) -> Tracer:
+        if name in self._FIELDS:
+            idx = self._FIELDS.index(name)
+            if idx >= self._vec_size:
+                raise AttributeError(
+                    f"Vector of size {self._vec_size} has no field .{name}"
+                )
+            return Tracer(ir.Member(self._expr, name), self._dtype)
+        raise AttributeError(name)
+
+
+class Local(Tracer):
+    """
+    A mutable local variable declared with ``sk.local``.
+
+    Reads behave like a normal scalar Tracer. Compound updates
+    (``local += x``, ``local -= x``, etc.) emit an Update statement.
+    """
+
+    __slots__ = ("_builder", "_name")
+
+    def __init__(self, name : str, dtype : dt.Dtype, builder : KernelBuilder):
+        super().__init__(ir.Var(name), dtype)
+        self._builder = builder
+        self._name = name
+
+    def _update(self, op : str, value) -> "Local":
+        self._builder.add_stmt(ir.Update(self._name, op, _to_expr(value)))
+        return self
+
+    def __iadd__(self, other):      return self._update("+=", other)
+    def __isub__(self, other):      return self._update("-=", other)
+    def __imul__(self, other):      return self._update("*=", other)
+    def __itruediv__(self, other):  return self._update("/=", other)
+    def __ifloordiv__(self, other): return self._update("/=", other)
+    def __imod__(self, other):      return self._update("%=", other)
+    def __iand__(self, other):      return self._update("&=", other)
+    def __ior__(self, other):       return self._update("|=", other)
+    def __ixor__(self, other):      return self._update("^=", other)
+    def __ilshift__(self, other):   return self._update("<<=", other)
+    def __irshift__(self, other):   return self._update(">>=", other)
+
+    def assign(self, value) -> None:
+        """
+        Assign a new value to this local: ``self = value;``.
+        """
+        self._builder.add_stmt(ir.Update(self._name, "=", _to_expr(value)))
+
+
+def local(dtype : dt.Dtype, init) -> Local:
+    """
+    Declare a mutable local variable in the current kernel.
+
+    Emits ``<dtype> name = <init>;`` and returns a Local handle that supports
+    compound assignment (``+=``, ``-=``, ...) and ``.assign(value)``.
+    """
+    builder = current_builder()
+    name = builder.fresh_name("v")
+    init_expr = _to_expr(init)
+    builder.add_stmt(ir.Assign(name, dtype.metal, init_expr))
+    return Local(name, dtype, builder)
+
+
+def range(*args):
+    """
+    Emit a ``for`` loop. Usage:
+
+        for i in sk.range(end): ...
+        for i in sk.range(start, end): ...
+        for i in sk.range(start, end, step): ...
+
+    Bounds and step may be Python ints or spork Tracers.
+    """
+    if len(args) == 1:
+        start_expr = ir.Const(0)
+        end_expr = _to_expr(args[0])
+        step_expr = ir.Const(1)
+    elif len(args) == 2:
+        start_expr = _to_expr(args[0])
+        end_expr = _to_expr(args[1])
+        step_expr = ir.Const(1)
+    elif len(args) == 3:
+        start_expr = _to_expr(args[0])
+        end_expr = _to_expr(args[1])
+        step_expr = _to_expr(args[2])
+    else:
+        raise TypeError(f"sk.range expects 1-3 arguments, got {len(args)}")
+    return _RangeLoop(start_expr, end_expr, step_expr)
+
+
+class _RangeLoop:
+    __slots__ = ("_start", "_end", "_step")
+
+    def __init__(self, start : ir.Expr, end : ir.Expr, step : ir.Expr):
+        self._start = start
+        self._end = end
+        self._step = step
+
+    def __iter__(self):
+        builder = current_builder()
+        loop_var = builder.fresh_name("i")
+        saved_stmts = builder.stmts
+        builder.stmts = []
+        try:
+            yield Tracer(ir.Var(loop_var), dt.uint32)
+        finally:
+            body = builder.stmts
+            builder.stmts = saved_stmts
+            builder.add_stmt(ir.ForLoop(
+                var_name=loop_var,
+                start=self._start,
+                end=self._end,
+                step=self._step,
+                body=body,
+            ))

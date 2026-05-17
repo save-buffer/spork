@@ -5,8 +5,33 @@ from . import ir
 from . import runtime
 from . import tracer as _tracer
 from .codegen import emit_kernel
-from .tracer import KernelBuilder, PointerTracer, Tracer
-from .types import DevicePointerSpec, ScalarParamSpec
+from .tracer import KernelBuilder, PointerTracer, Tracer, VectorTracer
+from .types import DevicePointerSpec, ScalarParamSpec, _ScalarTypeBase
+
+
+def _annotation_to_spec(ann, kernel_name : str, param_name : str):
+    """
+    Normalize a parameter annotation into a DevicePointerSpec or ScalarParamSpec.
+
+    A bare scalar class (e.g. ``sk.Uint``) becomes a constant ScalarParamSpec.
+    A subscripted form (e.g. ``sk.Uint[ThreadPositionInGrid]``) is already
+    a ScalarParamSpec.
+    """
+    if isinstance(ann, DevicePointerSpec):
+        return ann
+    if isinstance(ann, ScalarParamSpec):
+        return ann
+    if inspect.isclass(ann) and issubclass(ann, _ScalarTypeBase):
+        return ScalarParamSpec(
+            dtype=ann._dtype,
+            metal_name=ann._metal_name,
+            vec_size=ann._vec_size,
+            attribute=None,
+        )
+    raise TypeError(
+        f"Kernel '{kernel_name}': parameter '{param_name}' has unsupported "
+        f"annotation {ann!r}. Expected sk.DevicePointer[...] or sk.Uint[...] etc."
+    )
 
 
 class JittedKernel:
@@ -38,28 +63,30 @@ class JittedKernel:
                 raise TypeError(
                     f"Kernel '{self.name}': parameter '{param_name}' is missing a type annotation"
                 )
-            if isinstance(ann, DevicePointerSpec):
+            spec = _annotation_to_spec(ann, self.name, param_name)
+            if isinstance(spec, DevicePointerSpec):
                 builder.params.append(ir.Param(
                     name=param_name,
                     kind="pointer",
-                    dtype=ann.dtype,
+                    dtype=spec.dtype,
                 ))
-                tracer_args.append(PointerTracer(ir.Var(param_name), ann.dtype, builder))
-            elif isinstance(ann, ScalarParamSpec):
-                kind = "attribute" if ann.attribute is not None else "constant"
+                tracer_args.append(PointerTracer(ir.Var(param_name), spec.dtype, builder))
+            else:
+                kind = "attribute" if spec.attribute is not None else "constant"
                 builder.params.append(ir.Param(
                     name=param_name,
                     kind=kind,
-                    dtype=ann.dtype,
-                    metal_name=ann.metal_name,
-                    attribute=ann.attribute,
+                    dtype=spec.dtype,
+                    metal_name=spec.metal_name,
+                    vec_size=spec.vec_size,
+                    attribute=spec.attribute,
                 ))
-                tracer_args.append(Tracer(ir.Var(param_name), ann.dtype))
-            else:
-                raise TypeError(
-                    f"Kernel '{self.name}': parameter '{param_name}' has unsupported "
-                    f"annotation {ann!r}. Expected sk.DevicePointer[...] or sk.Uint[...] etc."
-                )
+                if spec.vec_size > 1:
+                    tracer_args.append(VectorTracer(
+                        ir.Var(param_name), spec.dtype, spec.vec_size,
+                    ))
+                else:
+                    tracer_args.append(Tracer(ir.Var(param_name), spec.dtype))
 
         token = _tracer._builder.set(builder)
         try:

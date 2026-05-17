@@ -1,3 +1,5 @@
+from typing import List
+
 from . import ir
 from .tracer import KernelBuilder
 
@@ -36,6 +38,8 @@ def format_expr(expr : ir.Expr, parent_prec : int = 0) -> str:
         return _format_const(expr.value)
     if isinstance(expr, ir.Load):
         return f"{format_expr(expr.ptr, 100)}[{format_expr(expr.index, 0)}]"
+    if isinstance(expr, ir.Member):
+        return f"{format_expr(expr.operand, 100)}.{expr.field}"
     if isinstance(expr, ir.BinOp):
         prec = _PREC.get(expr.op, 0)
         s = f"{format_expr(expr.lhs, prec)} {expr.op} {format_expr(expr.rhs, prec + 1)}"
@@ -49,6 +53,14 @@ def format_expr(expr : ir.Expr, parent_prec : int = 0) -> str:
     raise TypeError(f"Unknown expression node: {type(expr).__name__}")
 
 
+def _format_for_step(var_name : str, step : ir.Expr) -> str:
+    if isinstance(step, ir.Const) and step.value == 1:
+        return f"{var_name}++"
+    if isinstance(step, ir.Const) and step.value == -1:
+        return f"{var_name}--"
+    return f"{var_name} += {format_expr(step, 0)}"
+
+
 def format_stmt(stmt : ir.Stmt, indent : int = 4) -> str:
     pad = " " * indent
     if isinstance(stmt, ir.Store):
@@ -58,7 +70,24 @@ def format_stmt(stmt : ir.Stmt, indent : int = 4) -> str:
         )
     if isinstance(stmt, ir.Assign):
         return f"{pad}{stmt.metal_type} {stmt.name} = {format_expr(stmt.value, 0)};"
+    if isinstance(stmt, ir.Update):
+        return f"{pad}{stmt.name} {stmt.op} {format_expr(stmt.value, 0)};"
+    if isinstance(stmt, ir.ForLoop):
+        body_lines = format_stmts(stmt.body, indent + 4)
+        body = body_lines if body_lines else f"{pad}    // empty"
+        return (
+            f"{pad}for (uint {stmt.var_name} = {format_expr(stmt.start, 0)}; "
+            f"{stmt.var_name} < {format_expr(stmt.end, 0)}; "
+            f"{_format_for_step(stmt.var_name, stmt.step)})\n"
+            f"{pad}{{\n"
+            f"{body}\n"
+            f"{pad}}}"
+        )
     raise TypeError(f"Unknown statement node: {type(stmt).__name__}")
+
+
+def format_stmts(stmts : List[ir.Stmt], indent : int = 4) -> str:
+    return "\n".join(format_stmt(s, indent) for s in stmts)
 
 
 def _format_param(p : ir.Param, buffer_idx : int) -> tuple[str, int]:
@@ -89,7 +118,7 @@ def emit_kernel(builder : KernelBuilder) -> str:
         param_lines.append(line)
 
     params_block = ",\n".join(param_lines)
-    body = "\n".join(format_stmt(s) for s in builder.stmts)
+    body = format_stmts(builder.stmts, indent=4)
     if not body:
         body = "    // empty kernel"
 
