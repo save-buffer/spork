@@ -24,6 +24,8 @@ class KernelBuilder:
         self.name : str = name
         self.params : List[ir.Param] = []
         self.stmts : List[ir.Stmt] = []
+        self.includes : List[tuple] = [("metal_stdlib", True)]
+        self.usings : List[str] = ["metal"]
         self._name_counters : Dict[str, int] = {}
 
     def add_stmt(self, stmt : ir.Stmt) -> None:
@@ -34,16 +36,30 @@ class KernelBuilder:
         self._name_counters[prefix] = n + 1
         return f"{prefix}{n}"
 
+    def add_include(self, path : str, system : bool = True) -> None:
+        entry = (path, system)
+        if entry not in self.includes:
+            self.includes.append(entry)
+
+    def add_using(self, namespace : str) -> None:
+        if namespace not in self.usings:
+            self.usings.append(namespace)
+
 
 def _to_expr(value) -> ir.Expr:
     if isinstance(value, Tracer):
+        return value._expr
+    if isinstance(value, _OpaqueHandle):
         return value._expr
     if isinstance(value, VectorTracer):
         raise TypeError(
             "Cannot use a vector value as a scalar — access a field like .x first"
         )
     if isinstance(value, PointerTracer):
-        raise TypeError("Cannot use a pointer as a scalar value")
+        raise TypeError(
+            "Cannot use a pointer as a scalar value — index it with ptr[i] or "
+            "wrap it with sk.tensor(ptr, dtype, shape)"
+        )
     if isinstance(value, bool):
         return ir.Const(value)
     if isinstance(value, (int, float)):
@@ -51,6 +67,16 @@ def _to_expr(value) -> ir.Expr:
     raise TypeError(
         f"Cannot convert {value!r} (type {type(value).__name__}) to a spork expression"
     )
+
+
+class _OpaqueHandle:
+    """
+    Base class for handles to values with C++-opaque types (cooperative
+    tensors, tile slices, etc.). Subclasses set ``_expr`` to the IR
+    expression that references them by name.
+    """
+
+    _expr : ir.Expr
 
 
 def _result_dtype(a : "Tracer", other) -> Optional[dt.Dtype]:
@@ -477,3 +503,265 @@ def if_(cond) -> _IfBlock:
             out[i] = total
     """
     return _IfBlock(_to_expr(cond))
+
+
+# ---------------------------------------------------------------------------
+# MetalPerformancePrimitives: tensor views, matmul2d, cooperative tensors
+# ---------------------------------------------------------------------------
+
+
+class TensorHandle(_OpaqueHandle):
+    """
+    A handle to an ``mpp::tensor_ops::tensor`` view over a device pointer
+    with compile-time extents.
+    """
+
+    __slots__ = ("_name", "_dtype", "_shape", "_builder", "_expr")
+
+    def __init__(
+        self,
+        name    : str,
+        dtype   : dt.Dtype,
+        shape   : tuple,
+        builder : KernelBuilder,
+    ):
+        self._name = name
+        self._dtype = dtype
+        self._shape = shape
+        self._builder = builder
+        self._expr = ir.Var(name)
+
+    def slice(self, tile_shape, offsets) -> "TileSlice":
+        """
+        Take a sub-tile of compile-time shape ``tile_shape`` starting at
+        runtime offsets ``offsets``.
+
+        Emits ``auto tileN = self.slice<W, H, ...>(off0, off1, ...);`` and
+        returns an opaque handle referring to ``tileN``.
+        """
+        if not isinstance(tile_shape, tuple):
+            tile_shape = tuple(tile_shape)
+        if not isinstance(offsets, tuple):
+            offsets = tuple(offsets)
+        for d in tile_shape:
+            if not isinstance(d, int) or d <= 0:
+                raise TypeError(
+                    f"slice tile_shape must be positive Python ints, got {tile_shape!r}"
+                )
+        offset_exprs = [_to_expr(o) for o in offsets]
+        tile_name = self._builder.fresh_name("tile")
+        method = ir.MethodCall(
+            obj=ir.Var(self._name),
+            method="slice",
+            template_args=list(tile_shape),
+            args=offset_exprs,
+        )
+        self._builder.add_stmt(ir.Assign(tile_name, "auto", method))
+        return TileSlice(ir.Var(tile_name), self._dtype, tile_shape, self._builder)
+
+
+class TileSlice(_OpaqueHandle):
+    """
+    An opaque handle to a tile produced by ``TensorHandle.slice``.
+    """
+
+    __slots__ = ("_expr", "_dtype", "_shape", "_builder")
+
+    def __init__(
+        self,
+        expr    : ir.Expr,
+        dtype   : dt.Dtype,
+        shape   : tuple,
+        builder : KernelBuilder,
+    ):
+        self._expr = expr
+        self._dtype = dtype
+        self._shape = shape
+        self._builder = builder
+
+
+def tensor(ptr : PointerTracer, dtype : dt.Dtype, shape) -> TensorHandle:
+    """
+    Wrap a device pointer as an ``mpp::tensor_ops::tensor`` view with
+    compile-time extents.
+
+    Emits:
+
+        extents<int, D0, D1, ...> extN;
+        tensor tensorN(ptr, extN);
+    """
+    if not isinstance(ptr, PointerTracer):
+        raise TypeError(
+            f"sk.tensor expects a device pointer parameter, got {type(ptr).__name__}"
+        )
+    if isinstance(shape, int):
+        shape = (shape,)
+    else:
+        shape = tuple(shape)
+    for d in shape:
+        if not isinstance(d, int) or d <= 0:
+            raise TypeError(
+                f"tensor shape must be positive Python ints, got {shape!r}"
+            )
+    builder = current_builder()
+    builder.add_include("metal_tensor")
+    builder.add_include("MetalPerformancePrimitives/MetalPerformancePrimitives.h")
+    builder.add_using("mpp::tensor_ops")
+
+    extents_name = builder.fresh_name("ext")
+    shape_str = ", ".join(str(d) for d in shape)
+    builder.add_stmt(ir.DefaultDecl(
+        name=extents_name,
+        metal_type=f"extents<int, {shape_str}>",
+    ))
+    tensor_name = builder.fresh_name("tensor")
+    builder.add_stmt(ir.ConstructorDecl(
+        name=tensor_name,
+        metal_type="tensor",
+        args=[ptr._expr, ir.Var(extents_name)],
+    ))
+    return TensorHandle(tensor_name, dtype, shape, builder)
+
+
+_MATMUL2D_MODES = {
+    "multiply_accumulate" : "matmul2d_descriptor::mode::multiply_accumulate",
+    "multiply"            : "matmul2d_descriptor::mode::multiply",
+}
+
+
+class MatmulOp:
+    """
+    Handle to an ``mpp::tensor_ops::matmul2d`` op with a fixed descriptor
+    and execution policy.
+    """
+
+    __slots__ = ("_name", "_builder", "_tile_m", "_tile_n", "_tile_k")
+
+    def __init__(
+        self,
+        name    : str,
+        tile_m  : int,
+        tile_n  : int,
+        tile_k  : int,
+        builder : KernelBuilder,
+    ):
+        self._name = name
+        self._tile_m = tile_m
+        self._tile_n = tile_n
+        self._tile_k = tile_k
+        self._builder = builder
+
+    def get_destination(
+        self,
+        tensor_a : TensorHandle,
+        tensor_b : TensorHandle,
+        dtype    : dt.Dtype,
+    ) -> "CooperativeTensor":
+        """
+        Allocate the accumulator cooperative tensor:
+
+            auto coopN = opN.get_destination_cooperative_tensor<
+                decltype(tensorA), decltype(tensorB), <dtype>>();
+        """
+        coop_name = self._builder.fresh_name("coop")
+        method = ir.MethodCall(
+            obj=ir.Var(self._name),
+            method="get_destination_cooperative_tensor",
+            template_args=[
+                ir.Raw(f"decltype({tensor_a._name})"),
+                ir.Raw(f"decltype({tensor_b._name})"),
+                ir.Raw(dtype.metal),
+            ],
+            args=[],
+        )
+        self._builder.add_stmt(ir.Assign(coop_name, "auto", method))
+        return CooperativeTensor(coop_name, dtype, self._builder)
+
+    def run(self, tile_a : TileSlice, tile_b : TileSlice, coop : "CooperativeTensor") -> None:
+        """
+        Emit ``opN.run(tile_a, tile_b, coop);``.
+        """
+        call = ir.MethodCall(
+            obj=ir.Var(self._name),
+            method="run",
+            template_args=[],
+            args=[_to_expr(tile_a), _to_expr(tile_b), _to_expr(coop)],
+        )
+        self._builder.add_stmt(ir.ExprStmt(call))
+
+
+class CooperativeTensor(_OpaqueHandle):
+    """
+    Handle to a cooperative tensor (matmul2d accumulator).
+    """
+
+    __slots__ = ("_name", "_dtype", "_builder", "_expr")
+
+    def __init__(self, name : str, dtype : dt.Dtype, builder : KernelBuilder):
+        self._name = name
+        self._dtype = dtype
+        self._builder = builder
+        self._expr = ir.Var(name)
+
+    def store(self, tile : TileSlice) -> None:
+        """
+        Emit ``self.store(tile);``.
+        """
+        call = ir.MethodCall(
+            obj=ir.Var(self._name),
+            method="store",
+            template_args=[],
+            args=[_to_expr(tile)],
+        )
+        self._builder.add_stmt(ir.ExprStmt(call))
+
+
+def matmul2d(
+    m            : int,
+    n            : int,
+    k            : int,
+    *,
+    simdgroups   : int = 4,
+    transpose_a  : bool = False,
+    transpose_b  : bool = False,
+    transpose_c  : bool = False,
+    mode         : str = "multiply_accumulate",
+) -> MatmulOp:
+    """
+    Declare an ``mpp::tensor_ops::matmul2d`` op with the given tile sizes
+    and execution policy.
+
+    Emits:
+
+        constexpr auto descN = matmul2d_descriptor(M, N, K,
+            transA, transB, transC, <mode>);
+        matmul2d<descN, execution_simdgroups<S>> opN;
+    """
+    if mode not in _MATMUL2D_MODES:
+        raise ValueError(
+            f"Unknown matmul2d mode {mode!r}; expected one of {sorted(_MATMUL2D_MODES)}"
+        )
+    for v, label in ((m, "m"), (n, "n"), (k, "k"), (simdgroups, "simdgroups")):
+        if not isinstance(v, int) or v <= 0:
+            raise TypeError(f"matmul2d {label} must be a positive Python int, got {v!r}")
+
+    builder = current_builder()
+    builder.add_include("metal_compute")
+    builder.add_include("metal_tensor")
+    builder.add_include("MetalPerformancePrimitives/MetalPerformancePrimitives.h")
+    builder.add_using("mpp::tensor_ops")
+
+    desc_name = builder.fresh_name("desc")
+    desc_call = ir.Call("matmul2d_descriptor", [
+        ir.Const(m), ir.Const(n), ir.Const(k),
+        ir.Const(transpose_a), ir.Const(transpose_b), ir.Const(transpose_c),
+        ir.Raw(_MATMUL2D_MODES[mode]),
+    ])
+    builder.add_stmt(ir.Assign(desc_name, "constexpr auto", desc_call))
+
+    op_name = builder.fresh_name("op")
+    builder.add_stmt(ir.DefaultDecl(
+        name=op_name,
+        metal_type=f"matmul2d<{desc_name}, execution_simdgroups<{simdgroups}>>",
+    ))
+    return MatmulOp(op_name, m, n, k, builder)

@@ -65,12 +65,28 @@ class Call(Expr):
 
 
 @dataclass
+class MethodCall(Expr):
+    """
+    A method-call expression: ``obj.method<template_args>(args)``.
+
+    Template args may be Expr nodes (rendered with format_expr) or plain
+    Python ints/strs (rendered with str()). Empty template_args produces
+    no ``<...>`` suffix.
+    """
+
+    obj           : Expr
+    method        : str
+    template_args : List = field(default_factory=list)
+    args          : List["Expr"] = field(default_factory=list)
+
+
+@dataclass
 class Raw(Expr):
     """
     A verbatim chunk of Metal source embedded as an expression.
 
-    Useful for things like ``mem_flags::mem_threadgroup`` that don't deserve
-    their own IR node.
+    Useful for things like ``mem_flags::mem_threadgroup`` or ``decltype(x)``
+    that don't deserve their own IR node.
     """
 
     text : str
@@ -155,6 +171,31 @@ class ThreadgroupDecl(Stmt):
     name       : str
     metal_type : str
     shape      : List[int]
+
+
+@dataclass
+class DefaultDecl(Stmt):
+    """
+    Default-initialized declaration: ``<metal_type> <name>;``.
+
+    Used for e.g. ``extents<int, K, M> extA;`` or ``matmul2d<desc, ...> op;``.
+    """
+
+    name       : str
+    metal_type : str
+
+
+@dataclass
+class ConstructorDecl(Stmt):
+    """
+    Constructor-initialized declaration: ``<metal_type> <name>(arg0, arg1, ...);``.
+
+    Used for e.g. ``tensor tensorA(A, extA);``.
+    """
+
+    name       : str
+    metal_type : str
+    args       : List[Expr] = field(default_factory=list)
 
 
 @dataclass

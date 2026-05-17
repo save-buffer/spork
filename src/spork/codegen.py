@@ -22,7 +22,11 @@ def _format_const(value) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, int):
-        return str(value)
+        if value < 0 or value <= 2147483647:
+            return str(value)
+        if value <= 4294967295:
+            return f"{value}u"
+        return f"{value}ull"
     if isinstance(value, float):
         text = repr(value)
         if "." not in text and "e" not in text and "n" not in text:
@@ -53,6 +57,20 @@ def format_expr(expr : ir.Expr, parent_prec : int = 0) -> str:
     if isinstance(expr, ir.Call):
         args = ", ".join(format_expr(a, 0) for a in expr.args)
         return f"{expr.func}({args})"
+    if isinstance(expr, ir.MethodCall):
+        obj_str = format_expr(expr.obj, 100)
+        if expr.template_args:
+            targs = []
+            for t in expr.template_args:
+                if isinstance(t, ir.Expr):
+                    targs.append(format_expr(t, 0))
+                else:
+                    targs.append(str(t))
+            tmpl = f"<{', '.join(targs)}>"
+        else:
+            tmpl = ""
+        args = ", ".join(format_expr(a, 0) for a in expr.args)
+        return f"{obj_str}.{expr.method}{tmpl}({args})"
     if isinstance(expr, ir.Raw):
         return expr.text
     raise TypeError(f"Unknown expression node: {type(expr).__name__}")
@@ -112,6 +130,11 @@ def format_stmt(stmt : ir.Stmt, indent : int = 4) -> str:
     if isinstance(stmt, ir.ThreadgroupDecl):
         dims = "".join(f"[{d}]" for d in stmt.shape)
         return f"{pad}threadgroup {stmt.metal_type} {stmt.name}{dims};"
+    if isinstance(stmt, ir.DefaultDecl):
+        return f"{pad}{stmt.metal_type} {stmt.name};"
+    if isinstance(stmt, ir.ConstructorDecl):
+        args = ", ".join(format_expr(a, 0) for a in stmt.args)
+        return f"{pad}{stmt.metal_type} {stmt.name}({args});"
     raise TypeError(f"Unknown statement node: {type(stmt).__name__}")
 
 
@@ -151,9 +174,16 @@ def emit_kernel(builder : KernelBuilder) -> str:
     if not body:
         body = "    // empty kernel"
 
+    include_lines = "\n".join(
+        f"#include <{path}>" if system else f'#include "{path}"'
+        for path, system in builder.includes
+    )
+    using_lines = "\n".join(f"using namespace {ns};" for ns in builder.usings)
+
     return (
-        "#include <metal_stdlib>\n"
-        "using namespace metal;\n"
+        f"{include_lines}\n"
+        "\n"
+        f"{using_lines}\n"
         "\n"
         f"kernel void {builder.name}(\n"
         f"{params_block})\n"

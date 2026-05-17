@@ -1,8 +1,13 @@
 from . import dtypes as dt
 from .jit import JittedKernel, jit
 from .tracer import (
+    CooperativeTensor,
+    MatmulOp,
+    TensorHandle,
+    TileSlice,
     if_,
     local,
+    matmul2d,
     range,
     simd_all,
     simd_and,
@@ -23,6 +28,7 @@ from .tracer import (
     simd_sum,
     simd_xor,
     simdgroup_barrier,
+    tensor,
     threadgroup,
     threadgroup_barrier,
 )
@@ -64,6 +70,9 @@ __all__ = [
     "simd_prefix_inclusive_product", "simd_prefix_exclusive_product",
     "simd_broadcast", "simd_shuffle", "simd_shuffle_up",
     "simd_shuffle_down", "simd_shuffle_xor",
+    # MetalPerformancePrimitives
+    "tensor", "matmul2d",
+    "TensorHandle", "TileSlice", "MatmulOp", "CooperativeTensor",
     # Parameter type specs
     "DevicePointer",
     "ScalarParamSpec",
