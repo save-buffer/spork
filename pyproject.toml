@@ -1,8 +1,9 @@
 [project]
-name = "spork"
-version = "0.1.0"
-description = "Add your description here"
+name = "spork-metal"
+version = "0.1.1"
+description = "A tracing Python DSL for writing Metal compute kernels for Apple GPUs."
 readme = "README.md"
+license = { file = "LICENSE.md" }
 authors = [
     { name = "Sasha Krassovsky", email = "krassovskysasha@gmail.com" }
 ]
@@ -11,6 +12,37 @@ dependencies = [
     "numpy>=2.0",
     "pyobjc>=11.1",
 ]
+keywords = [
+    "metal",
+    "apple",
+    "gpu",
+    "kernel",
+    "dsl",
+    "tracing",
+    "compute",
+    "mlx",
+    "machine-learning",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Compilers",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage      = "https://github.com/save-buffer/spork"
+Repository    = "https://github.com/save-buffer/spork"
+Issues        = "https://github.com/save-buffer/spork/issues"
 
 [dependency-groups]
 dev = [
@@ -20,3 +52,6 @@ dev = [
 [build-system]
 requires = ["uv_build>=0.8.0,<0.9"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "spork"

@@ -9,6 +9,26 @@ Unlike Triton, Spork is a tracing DSL rather than a parsing-based DSL. This mean
 program is fundamentally a Python program that creates a Metal program. Spork can use any Python
 libraries to aid in metaprogramming. 
 
+## Installation
+
+Spork runs on Apple Silicon (or any Mac with Metal). Install it from PyPI:
+
+```bash
+pip install spork-metal
+```
+
+Or with [uv](https://docs.astral.sh/uv/):
+
+```bash
+uv add spork-metal
+```
+
+The package is published as `spork-metal` on PyPI; the import name is `spork`:
+
+```python
+import spork as sk
+```
+
 ## Example: Matrix Addition
 One of the most basic kernels is a matrix-addition kernel. In Numpy, you could write
 ```python
