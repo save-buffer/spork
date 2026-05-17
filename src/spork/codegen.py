@@ -137,7 +137,40 @@ def format_stmt(stmt : ir.Stmt, indent : int = 4) -> str:
     if isinstance(stmt, ir.ConstructorDecl):
         args = ", ".join(format_expr(a, 0) for a in stmt.args)
         return f"{pad}{stmt.metal_type} {stmt.name}({args});"
+    if isinstance(stmt, ir.WhileLoop):
+        body_lines = format_stmts(stmt.body, indent + 4)
+        body = body_lines if body_lines else f"{pad}    // empty"
+        return (
+            f"{pad}while ({format_expr(stmt.cond, 0)})\n"
+            f"{pad}{{\n"
+            f"{body}\n"
+            f"{pad}}}"
+        )
+    if isinstance(stmt, ir.Break):
+        return f"{pad}break;"
+    if isinstance(stmt, ir.Continue):
+        return f"{pad}continue;"
+    if isinstance(stmt, ir.Return):
+        if stmt.value is None:
+            return f"{pad}return;"
+        return f"{pad}return {format_expr(stmt.value, 0)};"
     raise TypeError(f"Unknown statement node: {type(stmt).__name__}")
+
+
+def emit_device_fn(df) -> str:
+    """
+    Emit a complete device-function definition in Allman style.
+    """
+    params_block = ", ".join(df._param_strs)
+    body = format_stmts(df._stmts, indent=4)
+    if not body:
+        body = "    // empty"
+    return (
+        f"{df._return_type} {df._name}({params_block})\n"
+        "{\n"
+        f"{body}\n"
+        "}\n"
+    )
 
 
 def format_stmts(stmts : List[ir.Stmt], indent : int = 4) -> str:
@@ -182,11 +215,19 @@ def emit_kernel(builder : KernelBuilder) -> str:
     )
     using_lines = "\n".join(f"using namespace {ns};" for ns in builder.usings)
 
+    device_fn_block = ""
+    if builder.device_functions:
+        device_fn_block = (
+            "\n".join(emit_device_fn(df) for df in builder.device_functions)
+            + "\n"
+        )
+
     return (
         f"{include_lines}\n"
         "\n"
         f"{using_lines}\n"
         "\n"
+        f"{device_fn_block}"
         f"kernel void {builder.name}(\n"
         f"{params_block})\n"
         "{\n"

@@ -345,3 +345,45 @@ def test_profile_smoke():
 
     assert os.path.exists(path)
     np.testing.assert_allclose(C, A + B)
+
+
+def test_device_fn_and_control_flow():
+    """
+    Exercises @sk.device_fn (newton_sqrt), sk.while_, sk.break_, and
+    sk.if_().else_() in one kernel.
+    """
+    N = 4096
+    A = np.random.rand(N).astype(np.float32) * 100.0  # positive inputs
+    # Sprinkle a few negatives to hit the else branch
+    A[::128] = -A[::128]
+    C = np.zeros(N, dtype=np.float32)
+
+    expected = np.where(A < 0.0, 0.0, np.sqrt(np.abs(A))).astype(np.float32)
+
+    @sk.device_fn
+    def newton_sqrt(x : sk.dt.float32) -> sk.dt.float32:
+        guess = sk.local(sk.dt.float32, x * 0.5)
+        i = sk.local(sk.dt.uint32, 0)
+        with sk.while_(i < 20):
+            new_guess = 0.5 * (guess + x / guess)
+            with sk.if_(sk.fabs(new_guess - guess) < 1e-6):
+                sk.break_()
+            guess.assign(new_guess)
+            i += 1
+        return guess
+
+    @sk.jit
+    def sqrt_kernel(
+        out : sk.DevicePointer[sk.dt.float32],
+        A   : sk.DevicePointer[sk.dt.float32],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        x = A[i]
+        with sk.if_(x < 0.0) as branch:
+            out[i] = 0.0
+        with branch.else_():
+            out[i] = newton_sqrt(x)
+
+    sqrt_kernel[(N // 128, 1, 1), (128, 1, 1)](C, A)
+
+    np.testing.assert_allclose(C, expected, atol=1e-4, rtol=1e-4)

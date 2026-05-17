@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`@sk.device_fn`** decorator for reusable device-side functions. Parameters
+  annotated with `sk.DevicePointer[dtype]` or a `dt.Dtype`; return type taken
+  from the `->` annotation (omitted means `void`). Traced lazily on first
+  call, emitted as a free function above the kernel, deduplicated across call
+  sites, and transitively pulls in any device fns it calls.
+- **`sk.while_(cond)`** context manager — emits a `while (cond) { ... }` loop;
+  the condition is re-evaluated each iteration.
+- **`sk.break_()`** and **`sk.continue_()`** — emit `break;` / `continue;` for
+  loop control flow.
+- **`with sk.if_(cond) as branch: ... ; with branch.else_(): ...`** — adds an
+  else branch to an existing if. Must immediately follow its matching `with
+  sk.if_` block.
+
+### IR
+
+- New `ir.Return`, `ir.WhileLoop`, `ir.Break`, `ir.Continue` nodes.
+
+### Internal
+
+- `KernelBuilder` gained a `device_functions` list and an `add_device_fn`
+  method that handles lazy tracing, topo-sorted dependency insertion, and
+  merging of the device fn's `#include`s and `using` directives back into the
+  kernel's.
+
 
 ## [0.2.0] — 2026-05-16
 

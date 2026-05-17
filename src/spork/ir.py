@@ -160,6 +160,35 @@ class IfStmt(Stmt):
 
 
 @dataclass
+class WhileLoop(Stmt):
+    """
+    A ``while (cond) { ... }`` loop.
+    """
+
+    cond : Expr
+    body : List[Stmt] = field(default_factory=list)
+
+
+@dataclass
+class Break(Stmt):
+    pass
+
+
+@dataclass
+class Continue(Stmt):
+    pass
+
+
+@dataclass
+class Return(Stmt):
+    """
+    Function return. ``value`` is None for void functions.
+    """
+
+    value : Optional[Expr] = None
+
+
+@dataclass
 class ExprStmt(Stmt):
     """
     A statement whose effect is just evaluating an expression

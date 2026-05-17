@@ -1,9 +1,10 @@
 import contextlib
 import contextvars
+import inspect
 import os
 import subprocess
 from tempfile import mkdtemp
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from Foundation import NSURL
 from Metal import (
@@ -15,6 +16,7 @@ from Metal import (
 from . import dtypes as dt
 from . import ir
 from . import runtime
+from .types import DevicePointerSpec
 
 
 _builder : contextvars.ContextVar[Optional["KernelBuilder"]] = contextvars.ContextVar(
@@ -38,6 +40,8 @@ class KernelBuilder:
         self.stmts : List[ir.Stmt] = []
         self.includes : List[tuple] = [("metal_stdlib", True)]
         self.usings : List[str] = ["metal"]
+        self.device_functions : List["DeviceFn"] = []
+        self._dfn_names : set = set()
         self._name_counters : Dict[str, int] = {}
 
     def add_stmt(self, stmt : ir.Stmt) -> None:
@@ -56,6 +60,26 @@ class KernelBuilder:
     def add_using(self, namespace : str) -> None:
         if namespace not in self.usings:
             self.usings.append(namespace)
+
+    def add_device_fn(self, df : "DeviceFn") -> None:
+        """
+        Register a DeviceFn as a dependency of this kernel. Traces it
+        lazily if needed and recursively pulls in transitive dependencies.
+        Also merges the device fn's includes/usings into this builder.
+        """
+        df._ensure_traced()
+        for dep in df._deps:
+            self.add_device_fn(dep)
+        if df._name in self._dfn_names:
+            return
+        self._dfn_names.add(df._name)
+        self.device_functions.append(df)
+        for inc in df._includes:
+            if inc not in self.includes:
+                self.includes.append(inc)
+        for ns in df._usings:
+            if ns not in self.usings:
+                self.usings.append(ns)
 
 
 def _to_expr(value) -> ir.Expr:
@@ -481,7 +505,96 @@ class _IfBlock:
 
     On enter, swaps in a fresh statement list so any kernel statements emitted
     inside the ``with`` block become the if-body. On exit, restores the outer
-    statement list and appends an IfStmt.
+    statement list and appends an IfStmt. Holds a reference to the appended
+    IfStmt so a paired ``.else_()`` block can mutate its ``else_body``.
+    """
+
+    __slots__ = ("_cond", "_builder", "_saved", "_if_stmt")
+
+    def __init__(self, cond : ir.Expr):
+        self._cond = cond
+        self._builder : Optional[KernelBuilder] = None
+        self._saved = None
+        self._if_stmt : Optional[ir.IfStmt] = None
+
+    def __enter__(self):
+        builder = current_builder()
+        self._builder = builder
+        self._saved = builder.stmts
+        builder.stmts = []
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        body = self._builder.stmts
+        self._builder.stmts = self._saved
+        self._if_stmt = ir.IfStmt(cond=self._cond, then_body=body, else_body=None)
+        self._builder.add_stmt(self._if_stmt)
+        return False
+
+    def else_(self) -> "_ElseBlock":
+        """
+        Open the matching ``else { ... }`` block. Must immediately follow
+        the ``with sk.if_(...)`` block — no statements may be emitted in
+        between.
+        """
+        if self._if_stmt is None:
+            raise RuntimeError(
+                "sk.if_(...).else_() can only be used after the if-block "
+                "has been exited."
+            )
+        return _ElseBlock(self)
+
+
+class _ElseBlock:
+    __slots__ = ("_if_block", "_builder", "_saved")
+
+    def __init__(self, if_block : _IfBlock):
+        self._if_block = if_block
+        self._builder : Optional[KernelBuilder] = None
+        self._saved = None
+
+    def __enter__(self):
+        builder = current_builder()
+        if not builder.stmts or builder.stmts[-1] is not self._if_block._if_stmt:
+            raise RuntimeError(
+                "sk.else_ block must immediately follow its matching sk.if_ "
+                "block (no statements in between)."
+            )
+        self._builder = builder
+        self._saved = builder.stmts
+        builder.stmts = []
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        body = self._builder.stmts
+        self._builder.stmts = self._saved
+        self._if_block._if_stmt.else_body = body
+        return False
+
+
+def if_(cond) -> _IfBlock:
+    """
+    Emit an ``if (cond) { ... }`` block.
+
+    Usage::
+
+        with sk.if_(thread_idx == 0):
+            out[i] = total
+
+    Pair with ``.else_()`` for an else branch::
+
+        with sk.if_(x > 0) as branch:
+            out[i] = x
+        with branch.else_():
+            out[i] = -x
+    """
+    return _IfBlock(_to_expr(cond))
+
+
+class _WhileBlock:
+    """
+    Context manager produced by ``sk.while_(cond)``. Pushes a fresh statement
+    list for the loop body; on exit, wraps the captured body in a WhileLoop.
     """
 
     __slots__ = ("_cond", "_builder", "_saved")
@@ -501,20 +614,40 @@ class _IfBlock:
     def __exit__(self, exc_type, exc, tb):
         body = self._builder.stmts
         self._builder.stmts = self._saved
-        self._builder.add_stmt(ir.IfStmt(cond=self._cond, then_body=body, else_body=None))
+        self._builder.add_stmt(ir.WhileLoop(cond=self._cond, body=body))
         return False
 
 
-def if_(cond) -> _IfBlock:
+def while_(cond) -> _WhileBlock:
     """
-    Emit an ``if (cond) { ... }`` block.
+    Emit a ``while (cond) { ... }`` loop.
 
-    Usage:
+    The condition is evaluated every iteration, so updates to locals
+    referenced in ``cond`` take effect each iteration.
 
-        with sk.if_(thread_idx == 0):
-            out[i] = total
+    Usage::
+
+        i = sk.local(sk.dt.uint32, 0)
+        with sk.while_(i < n):
+            ...
+            i += 1
     """
-    return _IfBlock(_to_expr(cond))
+    return _WhileBlock(_to_expr(cond))
+
+
+def break_() -> None:
+    """
+    Emit a ``break;`` statement (exit the innermost enclosing loop).
+    """
+    current_builder().add_stmt(ir.Break())
+
+
+def continue_() -> None:
+    """
+    Emit a ``continue;`` statement (jump to the next iteration of the
+    innermost enclosing loop).
+    """
+    current_builder().add_stmt(ir.Continue())
 
 
 # ---------------------------------------------------------------------------
@@ -1025,3 +1158,157 @@ def profile(name : str = "spork_trace", open_in_xcode : bool = True):
         manager.stopCapture()
         if open_in_xcode:
             subprocess.run(["open", trace_path])
+
+
+# ---------------------------------------------------------------------------
+# Device functions
+# ---------------------------------------------------------------------------
+
+
+class DeviceFn:
+    """
+    A reusable device-side function, traced once on first call.
+
+    Parameter annotations must each be either ``sk.DevicePointer[dtype]`` or
+    a ``dt.Dtype`` (for scalar-by-value parameters). The return annotation
+    determines the function's return type: omitted (or ``None``) means
+    ``void``; a ``dt.Dtype`` means the body must return a value of that type.
+
+    When called from inside a ``@sk.jit`` kernel (or from another device fn),
+    the device fn is registered as a dependency of the enclosing kernel so
+    its source is emitted alongside.
+    """
+
+    __slots__ = (
+        "_fn", "_name", "_sig", "_traced", "_tracing",
+        "_param_strs", "_return_type", "_return_dtype",
+        "_stmts", "_includes", "_usings", "_deps",
+    )
+
+    def __init__(self, fn : Callable):
+        self._fn = fn
+        self._name : str = fn.__name__
+        self._sig = inspect.signature(fn)
+        self._traced : bool = False
+        self._tracing : bool = False
+        self._param_strs : List[str] = []
+        self._return_type : str = "void"
+        self._return_dtype : Optional[dt.Dtype] = None
+        self._stmts : List[ir.Stmt] = []
+        self._includes : List[tuple] = []
+        self._usings : List[str] = []
+        self._deps : List["DeviceFn"] = []
+
+    def _ensure_traced(self) -> None:
+        if self._traced:
+            return
+        if self._tracing:
+            raise RuntimeError(
+                f"Device fn '{self._name}' is recursive; Metal does not support "
+                "recursion in device functions"
+            )
+        self._tracing = True
+        try:
+            self._do_trace()
+            self._traced = True
+        finally:
+            self._tracing = False
+
+    def _do_trace(self) -> None:
+        builder = KernelBuilder(self._name)
+        tracer_args = []
+        for param_name, param in self._sig.parameters.items():
+            if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
+                raise TypeError(
+                    f"Device fn '{self._name}': *args/**kwargs not supported"
+                )
+            ann = param.annotation
+            if ann is inspect.Parameter.empty:
+                raise TypeError(
+                    f"Device fn '{self._name}': parameter '{param_name}' is missing "
+                    "a type annotation"
+                )
+            if isinstance(ann, DevicePointerSpec):
+                self._param_strs.append(f"device {ann.dtype.metal} *{param_name}")
+                tracer_args.append(PointerTracer(ir.Var(param_name), ann.dtype, builder))
+            elif isinstance(ann, dt.Dtype):
+                self._param_strs.append(f"{ann.metal} {param_name}")
+                tracer_args.append(Tracer(ir.Var(param_name), ann))
+            else:
+                raise TypeError(
+                    f"Device fn '{self._name}': parameter '{param_name}' has "
+                    f"unsupported annotation {ann!r}. Expected sk.DevicePointer[...] "
+                    "or a spork dtype."
+                )
+
+        ret_ann = self._sig.return_annotation
+        if ret_ann is inspect.Parameter.empty or ret_ann is None or ret_ann is type(None):
+            self._return_type = "void"
+            self._return_dtype = None
+        elif isinstance(ret_ann, dt.Dtype):
+            self._return_type = ret_ann.metal
+            self._return_dtype = ret_ann
+        else:
+            raise TypeError(
+                f"Device fn '{self._name}': return annotation must be a spork dtype "
+                f"or omitted, got {ret_ann!r}"
+            )
+
+        token = _builder.set(builder)
+        try:
+            result = self._fn(*tracer_args)
+        finally:
+            _builder.reset(token)
+
+        if self._return_dtype is not None:
+            if result is None:
+                raise TypeError(
+                    f"Device fn '{self._name}' declared return type "
+                    f"{self._return_dtype.name} but returned None"
+                )
+            builder.add_stmt(ir.Return(_to_expr(result)))
+
+        self._stmts = builder.stmts
+        self._includes = list(builder.includes)
+        self._usings = list(builder.usings)
+        self._deps = list(builder.device_functions)
+
+    def __call__(self, *args):
+        builder = current_builder()
+        builder.add_device_fn(self)
+        if len(args) != len(self._param_strs):
+            raise TypeError(
+                f"Device fn '{self._name}' expected {len(self._param_strs)} "
+                f"argument(s), got {len(args)}"
+            )
+        arg_exprs = [_to_expr(a) for a in args]
+        call = ir.Call(self._name, arg_exprs)
+        if self._return_dtype is None:
+            builder.add_stmt(ir.ExprStmt(call))
+            return None
+        return Tracer(call, self._return_dtype)
+
+
+def device_fn(fn : Callable) -> DeviceFn:
+    """
+    Decorator marking a function as a reusable device function.
+
+    The function is traced once on its first call from inside a kernel and
+    emitted as a standalone Metal function above the calling kernel. Device
+    functions may call other device functions and use any kernel-body
+    primitives (sk.local, sk.range, sk.if_, sk.while_, simd intrinsics,
+    barriers, etc.).
+
+    Usage::
+
+        @sk.device_fn
+        def square(x : sk.dt.float32) -> sk.dt.float32:
+            return x * x
+
+        @sk.jit
+        def kernel(out : sk.DevicePointer[sk.dt.float32],
+                   A   : sk.DevicePointer[sk.dt.float32],
+                   i   : sk.Uint[sk.ThreadPositionInGrid]):
+            out[i] = square(A[i])
+    """
+    return DeviceFn(fn)

@@ -2,6 +2,7 @@ from . import dtypes as dt
 from .jit import JittedKernel, jit
 from .tracer import (
     CooperativeTensor,
+    DeviceFn,
     MatmulOp,
     TensorHandle,
     TileSlice,
@@ -20,11 +21,14 @@ from .tracer import (
     atomic_fetch_xor,
     atomic_load,
     atomic_store,
+    break_,
     cast,
     ceil,
     clamp,
+    continue_,
     cos,
     cosh,
+    device_fn,
     exp,
     exp2,
     fabs,
@@ -84,6 +88,7 @@ from .tracer import (
     threadgroup,
     threadgroup_barrier,
     trunc,
+    while_,
 )
 from .types import (
     DevicePointer,
@@ -113,6 +118,11 @@ __all__ = [
     "local",
     "range",
     "if_",
+    "while_",
+    "break_",
+    "continue_",
+    "device_fn",
+    "DeviceFn",
     "threadgroup",
     "threadgroup_barrier",
     "simdgroup_barrier",
