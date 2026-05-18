@@ -27,30 +27,46 @@ def _is_pow2(n : int) -> bool:
     return n > 0 and (n & (n - 1)) == 0
 
 
+_VALID_TRAVERSALS = ("zorder", "linear")
+
+
 def matmul(
-    M     : int,
-    N     : int,
-    K     : int,
-    dtype : dt.Dtype = dt.float32,
+    M         : int,
+    N         : int,
+    K         : int,
+    dtype     : dt.Dtype = dt.float32,
+    *,
+    traversal : str = "zorder",
 ) -> BoundKernel:
     """
     Tiled ``out = A @ B`` using MetalPerformancePrimitives ``matmul2d``
-    cooperative-tensor blocks, with Z-order tile dispatch for L2 locality.
+    cooperative-tensor blocks.
 
     Shapes:
       - A : (M, K)
       - B : (K, N)
       - out: (M, N)
 
-    Constraints (for this initial implementation):
+    Constraints:
       - ``M``, ``N`` must be multiples of 64 (the per-threadgroup tile size)
       - ``K`` must be a multiple of 128 (the K-tile size)
-      - ``M // 64`` and ``N // 64`` must each be powers of two (so the
-        Z-order curve covers exactly all tiles)
+      - For ``traversal="zorder"``: ``M // 64`` and ``N // 64`` must each be
+        powers of two (so the Z-order curve covers exactly all tiles)
 
-    Future tile-size or fallback paths can be added without changing the
-    public API.
+    ``traversal`` selects how threadgroups walk the output tile grid:
+
+    - ``"zorder"`` (default) — Morton-order bit interleaving. Improves L2
+      locality at sizes where the working set exceeds cache, at the cost of
+      a few bit-twiddle instructions per threadgroup.
+    - ``"linear"`` — row-major (``ix = tid % m_tiles``, ``iy = tid /
+      m_tiles``). No bit-twiddle overhead and no power-of-two requirement;
+      may be faster for matrices small enough to fit in L2 anyway.
     """
+    if traversal not in _VALID_TRAVERSALS:
+        raise ValueError(
+            f"matmul: traversal must be one of {_VALID_TRAVERSALS}, "
+            f"got {traversal!r}"
+        )
     if M % _TM != 0 or N % _TN != 0 or K % _TK != 0:
         raise ValueError(
             f"matmul: M and N must be multiples of {_TM} and K a multiple "
@@ -58,10 +74,11 @@ def matmul(
         )
     m_tiles = M // _TM
     n_tiles = N // _TN
-    if not (_is_pow2(m_tiles) and _is_pow2(n_tiles)):
+    if traversal == "zorder" and not (_is_pow2(m_tiles) and _is_pow2(n_tiles)):
         raise ValueError(
-            f"matmul: M//{_TM} and N//{_TN} must each be powers of two "
-            f"(Z-order tile dispatch); got {m_tiles} and {n_tiles}"
+            f"matmul: traversal='zorder' requires M//{_TM} and N//{_TN} to "
+            f"each be powers of two; got {m_tiles} and {n_tiles}. Pass "
+            "traversal='linear' to lift this restriction."
         )
 
     @jit
@@ -77,18 +94,23 @@ def matmul(
 
         tile_id = tgid.x
 
-        # Z-order decode of tile_id into (ix, iy) via bit interleaving.
-        ix = local(dt.uint32, tile_id & 0x55555555)
-        ix.assign((ix | (ix >> 1)) & 0x33333333)
-        ix.assign((ix | (ix >> 2)) & 0x0F0F0F0F)
-        ix.assign((ix | (ix >> 4)) & 0x00FF00FF)
-        ix.assign((ix | (ix >> 8)) & 0x0000FFFF)
+        if traversal == "zorder":
+            # Morton decode of tile_id into (ix, iy) via bit interleaving.
+            ix = local(dt.uint32, tile_id & 0x55555555)
+            ix.assign((ix | (ix >> 1)) & 0x33333333)
+            ix.assign((ix | (ix >> 2)) & 0x0F0F0F0F)
+            ix.assign((ix | (ix >> 4)) & 0x00FF00FF)
+            ix.assign((ix | (ix >> 8)) & 0x0000FFFF)
 
-        iy = local(dt.uint32, (tile_id >> 1) & 0x55555555)
-        iy.assign((iy | (iy >> 1)) & 0x33333333)
-        iy.assign((iy | (iy >> 2)) & 0x0F0F0F0F)
-        iy.assign((iy | (iy >> 4)) & 0x00FF00FF)
-        iy.assign((iy | (iy >> 8)) & 0x0000FFFF)
+            iy = local(dt.uint32, (tile_id >> 1) & 0x55555555)
+            iy.assign((iy | (iy >> 1)) & 0x33333333)
+            iy.assign((iy | (iy >> 2)) & 0x0F0F0F0F)
+            iy.assign((iy | (iy >> 4)) & 0x00FF00FF)
+            iy.assign((iy | (iy >> 8)) & 0x0000FFFF)
+        else:
+            # Linear row-major traversal.
+            ix = local(dt.uint32, tile_id % m_tiles)
+            iy = local(dt.uint32, tile_id // m_tiles)
 
         im = ix * _TM
         in_ = iy * _TN

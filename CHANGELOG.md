@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Forwards ``metal_source``, ``source_map``, ``grid``, ``threadgroup``,
   ``name`` for introspection.
 - **`sk.BoundKernel`** is now part of the public surface.
+- **`sk.kernels.matmul(..., traversal=...)`** keyword argument. Accepts
+  ``"zorder"`` (default; Morton bit-interleave) or ``"linear"`` (row-major,
+  ``tid % m_tiles`` / ``tid / m_tiles``). Linear has no bit-twiddle overhead
+  and lifts the power-of-two constraint on tile counts; Z-order trades a
+  few instructions per threadgroup for better L2 locality on large
+  matrices.
+- **`bench/matmul.py`** dev script — runs ``sk.kernels.matmul`` once,
+  checks correctness against numpy, and opens a ``.gputrace`` in Xcode for
+  perf inspection. Accepts dimensions and an optional traversal name.
 
 
 ## [0.4.0] — 2026-05-17
