@@ -114,6 +114,19 @@ class JittedKernel:
         grid_size, tg_size = dispatch_spec
         return _Launcher(self, grid_size, tg_size)
 
+    def bind(self, grid, threadgroup) -> "BoundKernel":
+        """
+        Return a BoundKernel that calls this kernel with ``grid`` and
+        ``threadgroup`` already baked in. Eliminates the
+        ``kernel[grid, tg](*args)`` boilerplate at each call site.
+
+        Usage::
+
+            bound = my_kernel.bind(grid=(8, 1, 1), threadgroup=(32, 1, 1))
+            bound(C, A, B)
+        """
+        return BoundKernel(self, grid, threadgroup)
+
     @property
     def metal_source(self) -> str:
         if self._source is None:
@@ -159,3 +172,41 @@ def jit(fn : Callable) -> JittedKernel:
     on its parameters; the resulting Metal source is compiled and dispatched.
     """
     return JittedKernel(fn)
+
+
+class BoundKernel:
+    """
+    A JittedKernel with its dispatch ``grid`` and ``threadgroup`` already
+    bound. Call it directly with the kernel's pointer + constant arguments
+    — no need to specify launch parameters at each call site.
+    """
+
+    __slots__ = ("_kernel", "_grid", "_threadgroup")
+
+    def __init__(self, kernel : JittedKernel, grid, threadgroup):
+        self._kernel = kernel
+        self._grid = tuple(int(x) for x in grid)
+        self._threadgroup = tuple(int(x) for x in threadgroup)
+
+    def __call__(self, *args):
+        self._kernel[self._grid, self._threadgroup](*args)
+
+    @property
+    def metal_source(self) -> str:
+        return self._kernel.metal_source
+
+    @property
+    def source_map(self):
+        return self._kernel.source_map
+
+    @property
+    def grid(self) -> tuple:
+        return self._grid
+
+    @property
+    def threadgroup(self) -> tuple:
+        return self._threadgroup
+
+    @property
+    def name(self) -> str:
+        return self._kernel.name

@@ -1,5 +1,6 @@
 from . import dtypes as dt
-from .jit import JittedKernel, jit
+from . import kernels
+from .jit import BoundKernel, JittedKernel, jit
 from .tracer import (
     CooperativeTensor,
     DeviceFn,
@@ -112,8 +113,10 @@ from .types import (
 
 __all__ = [
     "dt",
+    "kernels",
     "jit",
     "JittedKernel",
+    "BoundKernel",
     # Kernel-level control flow + memory
     "local",
     "range",

@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`spork.kernels` subpackage** — a library of pre-built kernels that take
+  the relevant compile-time dimensions/parameters, generate a specialized
+  kernel, compute the launch geometry, and return a callable with the
+  ``grid`` + ``threadgroup`` already bound. No more
+  ``kernel[grid, tg](*args)`` boilerplate at call sites.
+  - ``sk.kernels.matmul(M, N, K, dtype=dt.float32)`` — MPP ``matmul2d``
+    cooperative-tensor matmul with Z-order tile dispatch (TM=TN=64, TK=128;
+    requires M%64==N%64==K%128==0 and (M/64, N/64) powers of two for now;
+    clear `ValueError` otherwise).
+  - ``sk.kernels.matrix_add(shape, dtype=dt.float32)`` — elementwise add,
+    picks the largest power-of-two threadgroup size that divides
+    ``prod(shape)``.
+- **`JittedKernel.bind(grid, threadgroup)`** returns a new `BoundKernel` —
+  a callable that wraps the kernel with the dispatch geometry baked in.
+  Forwards ``metal_source``, ``source_map``, ``grid``, ``threadgroup``,
+  ``name`` for introspection.
+- **`sk.BoundKernel`** is now part of the public surface.
+
 
 ## [0.4.0] — 2026-05-17
 
