@@ -14,11 +14,13 @@ specify a grid or threadgroup size at the call site.
     add(C, A, B)
 """
 
+from .causal_gqa import causal_gqa
 from .matmul import matmul
 from .matmul_oneshot import matmul_oneshot
 from .matrix_add import matrix_add
 
 __all__ = [
+    "causal_gqa",
     "matmul",
     "matmul_oneshot",
     "matrix_add",

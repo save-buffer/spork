@@ -756,19 +756,26 @@ class TileSlice(_OpaqueHandle):
         self._source_tensor = source_tensor
 
 
-def tensor(ptr : PointerTracer, dtype : dt.Dtype, shape) -> TensorHandle:
+def tensor(ptr, dtype : dt.Dtype, shape) -> TensorHandle:
     """
-    Wrap a device pointer as an ``mpp::tensor_ops::tensor`` view with
-    compile-time extents.
+    Wrap a pointer-like value as an ``mpp::tensor_ops::tensor`` view with
+    compile-time extents. Accepts either:
+
+    - a device-pointer kernel parameter (``sk.DevicePointer[...]``), or
+    - a threadgroup-memory array (``sk.threadgroup(...)``).
 
     Emits:
 
         extents<int, D0, D1, ...> extN;
         tensor tensorN(ptr, extN);
+
+    Metal's ``tensor`` template deduces the address space from the pointer
+    argument's type.
     """
-    if not isinstance(ptr, PointerTracer):
+    if not isinstance(ptr, (PointerTracer, ThreadgroupArray)):
         raise TypeError(
-            f"sk.tensor expects a device pointer parameter, got {type(ptr).__name__}"
+            "sk.tensor expects a device pointer parameter or a threadgroup "
+            f"array, got {type(ptr).__name__}"
         )
     if isinstance(shape, int):
         shape = (shape,)
@@ -796,7 +803,11 @@ def tensor(ptr : PointerTracer, dtype : dt.Dtype, shape) -> TensorHandle:
         metal_type="tensor",
         args=[ptr._expr, ir.Var(extents_name)],
     ))
-    source_name = ptr._expr.name if isinstance(ptr._expr, ir.Var) else None
+    # Only device-pointer params need write-back tracking; threadgroup-memory
+    # arrays are scratch that disappears at the end of the kernel.
+    source_name = None
+    if isinstance(ptr, PointerTracer) and isinstance(ptr._expr, ir.Var):
+        source_name = ptr._expr.name
     return TensorHandle(tensor_name, dtype, shape, builder, source_pointer_name=source_name)
 
 

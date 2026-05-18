@@ -44,6 +44,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by MPP's per-tile resource budget.
 - **`bench/matmul_oneshot.py`** dev script — same shape as
   ``bench/matmul.py`` but for ``sk.kernels.matmul_oneshot``.
+- **`sk.kernels.causal_gqa(nq, nkv, qctx, nctx, dhead, dtype, *, block_m,
+  block_n)`** — fused causal Grouped-Query Attention in FlashAttention-2
+  style. Uses MPP ``matmul2d`` cooperative tensors for both Q@K^T and P@V;
+  runs the online-softmax pass (causal mask, row max/sum tracking,
+  rescaling of the running output) on threadgroup-memory scratch between
+  the two matmuls. Each threadgroup processes one ``(q_head, q_tile)``
+  pair. First version's softmax runs on a single thread per threadgroup
+  for clarity — perf-tuning is a follow-up.
+
+### Changed
+
+- **`sk.tensor(...)`** now accepts a ``sk.threadgroup(...)`` array (not
+  just a device-pointer parameter) so MPP cooperative tensors can be
+  stored to / sliced over threadgroup-memory scratch. Required for fused
+  attention-style kernels that need to inspect MPP results between two
+  matmuls.
 
 
 ## [0.4.0] — 2026-05-17
