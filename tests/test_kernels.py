@@ -62,6 +62,24 @@ def test_kernels_matmul():
     np.testing.assert_allclose(C, A @ B, atol=1e-2, rtol=1e-2)
 
 
+def test_kernels_matmul_oneshot():
+    """
+    sk.kernels.matmul_oneshot uses a single MPP call per output tile (no
+    K-loop), with the descriptor's K equal to the full problem K.
+    """
+    M = N = 256
+    K = 128
+    A = np.random.randn(M, K).astype(np.float32)
+    B = np.random.randn(K, N).astype(np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+
+    matmul = sk.kernels.matmul_oneshot(M, N, K)
+    assert matmul.grid == (M // 64, N // 64, 1)
+    assert matmul.threadgroup == (128, 1, 1)
+    matmul(C, A, B)
+    np.testing.assert_allclose(C, A @ B, atol=1e-2, rtol=1e-2)
+
+
 def test_kernels_matmul_linear_traversal():
     """
     traversal='linear' produces a working kernel and lifts the power-of-two

@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`bench/matmul.py`** dev script — runs ``sk.kernels.matmul`` once,
   checks correctness against numpy, and opens a ``.gputrace`` in Xcode for
   perf inspection. Accepts dimensions and an optional traversal name.
+- **`sk.kernels.matmul_oneshot(M, N, K, dtype=dt.float32)`** — single-call
+  MPP matmul2d per output tile, no Python-side K-loop and no custom
+  traversal (the descriptor's K equals the full problem K). Useful as the
+  simplest possible MPP baseline for perf comparisons; limited to small K
+  by MPP's per-tile resource budget.
+- **`bench/matmul_oneshot.py`** dev script — same shape as
+  ``bench/matmul.py`` but for ``sk.kernels.matmul_oneshot``.
 
 
 ## [0.4.0] — 2026-05-17

@@ -15,9 +15,11 @@ specify a grid or threadgroup size at the call site.
 """
 
 from .matmul import matmul
+from .matmul_oneshot import matmul_oneshot
 from .matrix_add import matrix_add
 
 __all__ = [
     "matmul",
+    "matmul_oneshot",
     "matrix_add",
 ]
