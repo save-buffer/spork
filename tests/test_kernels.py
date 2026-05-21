@@ -140,11 +140,12 @@ def _causal_gqa_numpy(Q, K, V):
 def test_kernels_causal_gqa():
     """
     Fused FlashAttention-2 with MPP matmul2d for Q@K^T and P@V. Tests
-    against a numpy reference at small dims.
+    against a numpy reference at small dims. Tile sizes and dhead are
+    bounded by the 32 KB threadgroup-memory budget.
     """
     nq, nkv = 4, 2
-    qctx, nctx = 64, 128
-    dhead = 128
+    qctx, nctx = 32, 64
+    dhead = 64
 
     np.random.seed(0)
     Q = np.random.randn(nq, qctx, dhead).astype(np.float32)
@@ -155,7 +156,7 @@ def test_kernels_causal_gqa():
     expected = _causal_gqa_numpy(Q, K, V)
 
     gqa = sk.kernels.causal_gqa(nq, nkv, qctx, nctx, dhead)
-    assert gqa.grid == (nq, qctx // 64, 1)
+    assert gqa.grid == (nq, qctx // 32, 1)
     assert gqa.threadgroup == (128, 1, 1)
     gqa(O, Q, K, V)
 

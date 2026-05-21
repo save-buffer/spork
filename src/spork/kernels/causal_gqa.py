@@ -16,7 +16,6 @@ from ..types import (
     DevicePointer,
     ThreadPositionInThreadgroup,
     ThreadgroupPositionInGrid,
-    Uint,
     Uint2,
 )
 
@@ -30,6 +29,9 @@ _SIMDGROUPS = 4
 _THREADGROUP_SIZE = 32 * _SIMDGROUPS
 
 
+_TG_MEM_BUDGET = 32 * 1024  # Apple Silicon threadgroup memory cap (bytes)
+
+
 def causal_gqa(
     nq      : int,
     nkv     : int,
@@ -38,8 +40,8 @@ def causal_gqa(
     dhead   : int,
     dtype   : dt.Dtype = dt.float32,
     *,
-    block_m : int = 64,
-    block_n : int = 64,
+    block_m : int = 32,
+    block_n : int = 32,
 ) -> BoundKernel:
     """
     Causal Grouped-Query Attention, fused FlashAttention-2 style.
@@ -82,6 +84,21 @@ def causal_gqa(
             f"block_n={block_n})"
         )
 
+    # Threadgroup memory budget: scores + pv + O + max + sum.
+    bytes_per = dtype.nbytes
+    tg_bytes = (
+        block_m * block_n * bytes_per      # scores_tg
+        + block_m * dhead * bytes_per      # pv_tg
+        + block_m * dhead * bytes_per      # O_tg
+        + 2 * block_m * bytes_per          # max_tg + sum_tg
+    )
+    if tg_bytes > _TG_MEM_BUDGET:
+        raise ValueError(
+            f"causal_gqa: threadgroup memory budget exceeded "
+            f"({tg_bytes} bytes > {_TG_MEM_BUDGET}). "
+            f"Reduce block_m / block_n / dhead, or use smaller dtype."
+        )
+
     nq_per_kv = nq // nkv
     n_kv_tiles = nctx // block_n
     inv_sqrt_d = 1.0 / math.sqrt(dhead)
@@ -93,7 +110,7 @@ def causal_gqa(
         K   : DevicePointer[dtype],
         V   : DevicePointer[dtype],
         bid : Uint2[ThreadgroupPositionInGrid],
-        tid : Uint[ThreadPositionInThreadgroup],
+        tid : Uint2[ThreadPositionInThreadgroup],
     ):
         iqhead = bid.x
         iqtile = bid.y
@@ -117,7 +134,7 @@ def causal_gqa(
         tPV = tensor(pv_tg,     dtype, (dhead,   block_m))
 
         # Initialize running stats and accumulator on thread 0.
-        with if_(tid == 0):
+        with if_(tid.x == 0):
             for i in range(block_m):
                 max_tg[i] = _NEG_INF
                 sum_tg[i] = 0.0
@@ -125,7 +142,11 @@ def causal_gqa(
                     O_tg[i, d] = 0.0
         threadgroup_barrier()
 
-        op_s  = matmul2d(block_m, block_n, dhead,  simdgroups=_SIMDGROUPS)
+        # op_s computes S = Q @ K^T. K is stored as (nctx, dhead) row-major,
+        # so we need transpose_b to feed it to MPP as the (dhead, nctx) K^T.
+        # op_pv computes O += P @ V — standard matmul, no transposes.
+        op_s  = matmul2d(block_m, block_n, dhead, simdgroups=_SIMDGROUPS,
+                         transpose_b=True)
         op_pv = matmul2d(block_m, dhead,  block_n, simdgroups=_SIMDGROUPS)
 
         # Q-tile slice (same every iteration).
@@ -143,7 +164,7 @@ def causal_gqa(
             threadgroup_barrier()
 
             # ----- Causal mask + online softmax (thread 0 serial) -----
-            with if_(tid == 0):
+            with if_(tid.x == 0):
                 for i in range(block_m):
                     q_pos = iqtile * block_m + i
 
@@ -194,14 +215,14 @@ def causal_gqa(
             threadgroup_barrier()
 
             # Add PV into running O (thread 0 serial).
-            with if_(tid == 0):
+            with if_(tid.x == 0):
                 for i in range(block_m):
                     for d in range(dhead):
                         O_tg[i, d] = O_tg[i, d] + pv_tg[i, d]
             threadgroup_barrier()
 
         # Normalize by running sum and write O to device (thread 0 serial).
-        with if_(tid == 0):
+        with if_(tid.x == 0):
             for i in range(block_m):
                 inv = local(dtype, 1.0 / sum_tg[i])
                 out_row = local(dt.uint32, iqhead * qctx + iqtile * block_m + i)

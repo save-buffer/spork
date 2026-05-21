@@ -20,6 +20,12 @@ from . import runtime
 from .types import DevicePointerSpec
 
 
+# Preserve a reference to the builtin ``range`` since this module also
+# defines ``range`` (the spork kernel-loop primitive). Any Python-level for
+# loops inside this module must use ``_py_range``.
+_py_range = range
+
+
 _SPORK_PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -797,11 +803,25 @@ def tensor(ptr, dtype : dt.Dtype, shape) -> TensorHandle:
         name=extents_name,
         metal_type=f"extents<int, {shape_str}>",
     ))
+
+    # Build the constructor's pointer argument. A multi-dim threadgroup array
+    # has type ``threadgroup T[D0][D1]...``; passing it directly would let
+    # MPP's tensor template deduce ``ElementType = T[D1]...`` instead of T.
+    # Take the address of the first scalar element so the deduced element
+    # type is the underlying scalar.
+    if isinstance(ptr, ThreadgroupArray) and len(ptr._shape) > 1:
+        idx_expr : ir.Expr = ptr._expr
+        for _ in _py_range(len(ptr._shape)):
+            idx_expr = ir.Load(idx_expr, ir.Const(0))
+        ptr_arg : ir.Expr = ir.AddrOf(idx_expr)
+    else:
+        ptr_arg = ptr._expr
+
     tensor_name = builder.fresh_name("tensor")
     builder.add_stmt(ir.ConstructorDecl(
         name=tensor_name,
         metal_type="tensor",
-        args=[ptr._expr, ir.Var(extents_name)],
+        args=[ptr_arg, ir.Var(extents_name)],
     ))
     # Only device-pointer params need write-back tracking; threadgroup-memory
     # arrays are scratch that disappears at the end of the kernel.
