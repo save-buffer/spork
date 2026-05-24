@@ -26,6 +26,7 @@ from .. import tracer as _spork_tracer
 from ..types import (
     DevicePointerSpec,
     ScalarParamSpec,
+    ThreadPositionInGrid,
     ThreadgroupPositionInGrid,
 )
 from ._backend import OutputSpec, TypedDevicePointerSpec, _untyped_pointer_spec
@@ -39,10 +40,14 @@ from .primitives import (
 )
 
 
-# Attribute classes whose component values genuinely correspond to grid
-# axes — i.e. they vary per-threadgroup-or-thread and partition the
-# global work. For coverage tracking we only enumerate over these.
-_GRID_ATTRS = (ThreadgroupPositionInGrid,)
+# Attribute classes whose component values correspond to grid axes —
+# they vary across the dispatched work and can partition the output.
+# Each entry maps the attribute class to its GridAxisInfo "kind"
+# string for the coverage check's enumeration.
+_GRID_ATTR_KINDS = {
+    ThreadgroupPositionInGrid : "tgid",
+    ThreadPositionInGrid      : "gid",
+}
 
 
 _OUTPUT_PARAM_INDEX = 0
@@ -67,7 +72,11 @@ class VerifiedJittedKernel:
     def bind(self, grid, threadgroup) -> BoundKernel:
         # Ensure we have a trace (and thus stored_slices populated).
         self._kernel._ensure_compiled()
-        _coverage.check_coverage(self._state, tuple(int(x) for x in grid))
+        _coverage.check_coverage(
+            self._state,
+            tuple(int(x) for x in grid),
+            tuple(int(x) for x in threadgroup),
+        )
         return self._kernel.bind(grid, threadgroup)
 
     def __getitem__(self, dispatch_spec):
@@ -150,19 +159,27 @@ def jit(
             )
 
         # Identify grid-position attribute params and figure out which
-        # vector component → which grid axis. For
+        # vector component → which grid axis & kind. For
         # ``bid : Uint2[ThreadgroupPositionInGrid]``, vector
-        # components (x, y, z) map to grid axes (0, 1, 2).
-        grid_param_components : dict[str, list[str]] = {}
+        # components (x, y, z) map to grid axes (0, 1, 2) with kind
+        # "tgid". For ``i : Uint[ThreadPositionInGrid]`` (scalar), the
+        # single value maps to axis 0 with kind "gid" (per-thread range).
+        grid_param_components : dict[str, tuple] = {}
         for name, param in params:
             ann = param.annotation
             if isinstance(ann, ScalarParamSpec) and ann.attribute is not None:
-                if any(issubclass(ann.attribute, A) for A in _GRID_ATTRS):
-                    if ann.vec_size > 1:
-                        components = ["x", "y", "z", "w"][:ann.vec_size]
-                    else:
-                        components = [None]
-                    grid_param_components[name] = components
+                kind = None
+                for attr_cls, k in _GRID_ATTR_KINDS.items():
+                    if issubclass(ann.attribute, attr_cls):
+                        kind = k
+                        break
+                if kind is None:
+                    continue
+                if ann.vec_size > 1:
+                    components = ["x", "y", "z", "w"][:ann.vec_size]
+                else:
+                    components = [None]
+                grid_param_components[name] = (components, kind)
 
         # State that lives across the trace and feeds .bind's coverage
         # check. Populated by the wrapper below + `record_store` calls
@@ -187,17 +204,22 @@ def jit(
                 elif isinstance(arg, _spork_tracer.VectorTracer):
                     typed_vec = TypedVectorTracer(arg, var_name_prefix=name)
                     if name in grid_param_components:
-                        # Register each component's SymbolicInt → grid axis.
-                        for axis, comp in enumerate(grid_param_components[name]):
+                        components, kind = grid_param_components[name]
+                        for axis, comp in enumerate(components):
                             if comp is None:
                                 continue
                             sym = typed_vec._sym_components[comp]
-                            state.pid_axes[sym.name] = axis
+                            state.pid_axes[sym.name] = _coverage.GridAxisInfo(
+                                axis=axis, kind=kind,
+                            )
                     wrapped.append(typed_vec)
                 elif isinstance(arg, _spork_tracer.Tracer):
                     sym = SymbolicInt(name=f"_{name}")
                     if name in grid_param_components:
-                        state.pid_axes[sym.name] = 0
+                        _components, kind = grid_param_components[name]
+                        state.pid_axes[sym.name] = _coverage.GridAxisInfo(
+                            axis=0, kind=kind,
+                        )
                     wrapped.append(TypedScalarTracer(tracer=arg, sym=sym))
                 else:
                     wrapped.append(arg)

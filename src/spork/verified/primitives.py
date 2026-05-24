@@ -15,11 +15,14 @@ from typing import Optional, Tuple
 
 import stile.type as t
 from stile.type import (
+    BinaryOp,
     Constant,
     FullDim,
     ShapeType,
+    Sliced,
     Tensor,
     Type,
+    UnaryOp,
     as_int,
     dim_full_dim,
     dim_name,
@@ -39,6 +42,12 @@ from . import _coverage
 from ._backend import OutputSpec
 
 
+# Save the builtin ``range`` since this module also defines ``range``
+# (the verified runtime-loop primitive). Any Python-level for loops in
+# this module must use ``_py_range``.
+_py_range = range
+
+
 class TypedTensorHandle:
     """
     A spork ``TensorHandle`` paired with a stile ``Type``.
@@ -52,17 +61,23 @@ class TypedTensorHandle:
     record their writes for the bind-time coverage check.
     """
 
-    __slots__ = ("_handle", "_type", "_is_output")
+    __slots__ = ("_handle", "_type", "_is_output", "_ptr")
 
     def __init__(
         self,
         handle    : _spork_tracer.TensorHandle,
         type      : Type,
         is_output : bool = False,
+        ptr       = None,
     ):
         self._handle = handle
         self._type = type
         self._is_output = is_output
+        # The original device-pointer parameter (PointerTracer) or
+        # threadgroup array; needed for element-wise indexing via
+        # __getitem__ / __setitem__, since MPP ``tensor`` wrappers
+        # aren't subscriptable in Metal.
+        self._ptr = ptr
 
     @property
     def type(self) -> Type:
@@ -170,6 +185,7 @@ def tensor(
     return TypedTensorHandle(
         handle=handle,
         type=Type(st=shape_tuple, et=et, dt=None),
+        ptr=typed_pointer,
     )
 
 
@@ -209,6 +225,7 @@ def make_output_handle(
         handle=handle,
         type=Type(st=spec.st, et=spec_type.et, dt=output_dtype),
         is_output=True,
+        ptr=ptr,
     )
 
 
@@ -696,4 +713,229 @@ class _TypedRange:
             #    were touched in this body as ParametricReduce.
             popped = _coverage._active_loops.pop()
             _coverage.wrap_loop_accumulators(popped)
+
+
+# ---------------------------------------------------------------------------
+# Typed scalar values + element-level tensor reads / writes
+# ---------------------------------------------------------------------------
+
+
+class TypedScalarValue:
+    """
+    A typed scalar VALUE — the result of reading a single element from a
+    typed tensor, or of arithmetic between typed scalars.
+
+    Distinct from ``TypedScalarTracer``, which carries a stile
+    ``SymbolicInt`` for slice-offset arithmetic. ``TypedScalarValue``
+    carries a stile ``Type`` with shape ``()`` and an ``ExprType`` that
+    composes via stile's ``BinaryOp`` / ``UnaryOp`` constructors.
+
+    Backed on the spork side by an ordinary ``Tracer`` (or a numeric
+    literal lifted into one) so the kernel still emits Metal for the
+    arithmetic.
+    """
+
+    __slots__ = ("_tracer", "_type")
+
+    def __init__(self, tracer, type : Type):
+        self._tracer = tracer
+        self._type = type
+
+    @property
+    def type(self) -> Type:
+        return self._type
+
+    def _binop(self, op : str, other) -> "TypedScalarValue":
+        other_tracer, other_et = _lower_value(other)
+        new_tracer = _spork_binop(self._tracer, op, other_tracer)
+        new_et = BinaryOp(op=op, lhs=self._type.et, rhs=other_et)
+        return TypedScalarValue(new_tracer, Type(st=(), et=new_et, dt=self._type.dt))
+
+    def __add__(self, other):     return self._binop("+", other)
+    def __radd__(self, other):    return _lift_value(other)._binop("+", self)
+    def __sub__(self, other):     return self._binop("-", other)
+    def __rsub__(self, other):    return _lift_value(other)._binop("-", self)
+    def __mul__(self, other):     return self._binop("*", other)
+    def __rmul__(self, other):    return _lift_value(other)._binop("*", self)
+    def __truediv__(self, other): return self._binop("/", other)
+    def __rtruediv__(self, other):return _lift_value(other)._binop("/", self)
+    def __neg__(self):            return TypedScalarValue(
+        -self._tracer,
+        Type(st=(), et=BinaryOp(op="-", lhs=Constant(0.0), rhs=self._type.et), dt=self._type.dt),
+    )
+
+
+def _lower_value(x) -> tuple:
+    """
+    Coerce ``x`` to ``(spork_tracer_or_value, stile_et)`` for use as the
+    rhs of a typed scalar binop. Accepts TypedScalarValue, plain Python
+    int/float, and TypedScalarTracer (its symbolic index is taken as
+    the value's expression — useful when an index is used inside a
+    value-arithmetic context, though it's an unusual mix).
+    """
+    if isinstance(x, TypedScalarValue):
+        return x._tracer, x._type.et
+    if isinstance(x, TypedScalarTracer):
+        return x._tracer, Constant(0.0)  # treat as opaque value
+    if isinstance(x, (int, float, bool)):
+        return x, Constant(float(x) if not isinstance(x, bool) else x)
+    raise TypeError(f"Can't lower {type(x).__name__} to a typed scalar value")
+
+
+def _lift_value(x) -> "TypedScalarValue":
+    """Lift a Python literal into a TypedScalarValue carrying a Constant ET."""
+    if isinstance(x, TypedScalarValue):
+        return x
+    if isinstance(x, (int, float)):
+        return TypedScalarValue(x, Type(st=(), et=Constant(float(x)), dt=None))
+    raise TypeError(f"Can't lift {type(x).__name__} to TypedScalarValue")
+
+
+def _spork_binop(lhs, op : str, rhs):
+    """Apply a Python binary op to the underlying spork tracers."""
+    if op == "+":   return lhs + rhs
+    if op == "-":   return lhs - rhs
+    if op == "*":   return lhs * rhs
+    if op == "/":   return lhs / rhs
+    raise ValueError(f"Unsupported binop {op!r}")
+
+
+# Typed __getitem__ / __setitem__ on TypedTensorHandle
+# ---------------------------------------------------------------------------
+
+
+def _typed_getitem(self, index) -> TypedScalarValue:
+    """
+    Read a single element of the typed tensor by ``(i, j, ...)`` (math
+    order). Returns a TypedScalarValue whose stile ExprType is the same
+    Tensor leaf as the handle.
+    """
+    if self._ptr is None:
+        raise TypeError(
+            "Typed __getitem__ requires the typed tensor to have a "
+            "backing device pointer (got None — was it constructed via "
+            "an MPP-only path?)"
+        )
+    indices = _normalize_indices(index)
+    flat_idx = _flatten_indices(indices, self._type.st)
+    # Use the raw spork PointerTracer's __getitem__ for the load —
+    # MPP's tensor wrapper isn't subscriptable in Metal.
+    spork_scalar = self._ptr[flat_idx]
+    return TypedScalarValue(
+        spork_scalar,
+        Type(st=(), et=self._type.et, dt=self._handle._dtype),
+    )
+
+
+def _typed_setitem(self, index, value) -> None:
+    """
+    Write a single element. Records a per-element store into the active
+    state's stored_slices so the bind-time coverage check sees the
+    element-level coverage too.
+    """
+    if self._ptr is None:
+        raise TypeError(
+            "Typed __setitem__ requires the typed tensor to have a "
+            "backing device pointer (got None)"
+        )
+    indices = _normalize_indices(index)
+    if len(indices) != len(self._type.st):
+        raise TypeError(
+            f"Typed tensor __setitem__ expects {len(self._type.st)} "
+            f"indices (one per declared dim), got {len(indices)}"
+        )
+
+    # Per-element coverage: each axis becomes Sliced(dim, idx, idx+1).
+    sliced_shape = tuple(
+        _per_element_sliced(parent_dim, idx)
+        for parent_dim, idx in zip(self._type.st, indices)
+    )
+    if self._is_output:
+        _coverage.record_store(self, sliced_shape)
+
+    # Spork side: flatten the math-order indices to a single offset and
+    # store via the raw PointerTracer.
+    flat_idx = _flatten_indices(indices, self._type.st)
+    val_expr = (
+        value._tracer if isinstance(value, (TypedScalarValue, TypedScalarTracer))
+        else value
+    )
+    self._ptr[flat_idx] = val_expr
+
+
+def _flatten_indices(indices, shape):
+    """
+    Compute the row-major flat offset for ``indices`` given the
+    math-order ``shape`` (a tuple of stile dims). Each index can be a
+    Python int, a TypedScalarTracer, or a raw spork Tracer; the result
+    is a spork Tracer expression (or Python int) suitable for direct
+    use as a PointerTracer subscript.
+    """
+    sizes = [as_int(dim_size(d)) for d in shape]
+    strides = [1] * len(sizes)
+    for i in _py_range(len(sizes) - 2, -1, -1):
+        strides[i] = strides[i + 1] * sizes[i + 1]
+
+    flat = None
+    for idx, stride in zip(indices, strides):
+        idx_tracer = (
+            idx._tracer if isinstance(idx, TypedScalarTracer) else idx
+        )
+        term = idx_tracer * stride if stride != 1 else idx_tracer
+        flat = term if flat is None else flat + term
+    return flat if flat is not None else 0
+
+
+def _normalize_indices(index) -> tuple:
+    if isinstance(index, tuple):
+        return index
+    return (index,)
+
+
+def _per_element_sliced(parent_dim, idx) -> "Sliced | FullDim":
+    """One-element slice ``Sliced(dim, idx, idx+1)``."""
+    if isinstance(idx, int):
+        sym_idx = idx
+    elif isinstance(idx, TypedScalarTracer):
+        sym_idx = idx._sym
+    else:
+        # Unknown index — treat as full coverage on this axis (sound).
+        return parent_dim
+    return Sliced(dim=dim_full_dim(parent_dim), start=sym_idx, end=sym_idx + 1)
+
+
+TypedTensorHandle.__getitem__ = _typed_getitem
+TypedTensorHandle.__setitem__ = _typed_setitem
+
+
+# ---------------------------------------------------------------------------
+# Typed math intrinsics (operate on TypedScalarValue)
+# ---------------------------------------------------------------------------
+
+
+def _math_intrinsic(spork_fn, stile_op_name : str, x : TypedScalarValue) -> TypedScalarValue:
+    if not isinstance(x, TypedScalarValue):
+        raise TypeError(
+            f"skv math intrinsic expects a TypedScalarValue, got "
+            f"{type(x).__name__}"
+        )
+    new_tracer = spork_fn(x._tracer)
+    new_et = UnaryOp(op=stile_op_name, child=x._type.et)
+    return TypedScalarValue(new_tracer, Type(st=(), et=new_et, dt=x._type.dt))
+
+
+def exp(x : TypedScalarValue) -> TypedScalarValue:
+    return _math_intrinsic(_spork_tracer.exp, "exp", x)
+
+
+def sqrt(x : TypedScalarValue) -> TypedScalarValue:
+    return _math_intrinsic(_spork_tracer.sqrt, "sqrt", x)
+
+
+def sin(x : TypedScalarValue) -> TypedScalarValue:
+    return _math_intrinsic(_spork_tracer.sin, "sin", x)
+
+
+def cos(x : TypedScalarValue) -> TypedScalarValue:
+    return _math_intrinsic(_spork_tracer.cos, "cos", x)
 

@@ -26,23 +26,46 @@ from stile.type import BinaryOp, ParametricReduce, Sliced, ShapeType, Type
 
 
 @dataclass
+class GridAxisInfo:
+    """
+    How to enumerate a grid-position SymbolicInt at .bind() time:
+    ``axis`` is the axis index, ``kind`` selects the enumeration range.
+    """
+    axis : int
+    kind : str  # "tgid" | "gid" — threadgroup_position vs thread_position_in_grid
+
+    def iter_values(self, grid : tuple, threadgroup : tuple) -> "list[int]":
+        if self.axis >= len(grid):
+            raise ValueError(
+                f"GridAxisInfo: axis {self.axis} out of range for grid {grid!r}"
+            )
+        if self.kind == "tgid":
+            return list(__builtins__["range"](int(grid[self.axis]))) if False else list(range(int(grid[self.axis])))
+        if self.kind == "gid":
+            return list(range(int(grid[self.axis]) * int(threadgroup[self.axis])))
+        raise ValueError(f"Unknown GridAxisInfo kind {self.kind!r}")
+
+
+@dataclass
 class VerifiedKernelState:
     """
     Per-kernel verifier state populated during trace; consulted at
     ``.bind(grid=..., threadgroup=...)`` for the coverage check.
 
-    ``pid_axes`` maps a grid-position SymbolicInt name → its grid-axis
-    index (so ``_bid_x → 0`` etc.).
+    ``pid_axes`` maps a grid-position SymbolicInt name → a
+    ``GridAxisInfo`` describing how to enumerate that symbol at bind
+    time (which axis, and whether it's a per-threadgroup index that
+    ranges over ``grid[axis]`` or a per-thread index that ranges over
+    ``grid[axis] * threadgroup[axis]``).
 
     ``loop_var_ranges`` maps a runtime-loop SymbolicInt name →
     ``(lo, hi, step)`` Python ints describing the loop's iteration range.
     Populated by ``skv.range`` when it's used inside the kernel body.
-    Both are enumerated during coverage check.
     """
     output_ptr_name : Optional[str] = None
     output_shape   : ShapeType = ()
     stored_slices  : List[Tuple] = field(default_factory=list)
-    pid_axes       : dict = field(default_factory=dict)
+    pid_axes       : dict = field(default_factory=dict)  # name → GridAxisInfo
     loop_var_ranges : dict = field(default_factory=dict)
 
 
@@ -135,7 +158,11 @@ def record_store(output_handle, sliced_shape : ShapeType) -> None:
     state.stored_slices.append(tuple(sliced_shape))
 
 
-def check_coverage(state : VerifiedKernelState, grid : tuple) -> None:
+def check_coverage(
+    state       : VerifiedKernelState,
+    grid        : tuple,
+    threadgroup : tuple,
+) -> None:
     """
     Verify the union of per-store slices covers the declared output
     shape on every axis. Raises ``ValueError`` with a clear message on
@@ -170,7 +197,7 @@ def check_coverage(state : VerifiedKernelState, grid : tuple) -> None:
         # Enumerate all (SymbolicInt → int) substitutions over their
         # registered grid ranges. If any atom isn't registered, skip
         # this store (treat as opaque-fully-covered).
-        substitutions = _enumerate_substitutions(atoms, state, grid)
+        substitutions = _enumerate_substitutions(atoms, state, grid, threadgroup)
         if substitutions is None:
             continue
 
@@ -218,13 +245,15 @@ def _enumerate_substitutions(
     atoms : "set[SymbolicInt]",
     state : "VerifiedKernelState",
     grid : tuple,
+    threadgroup : tuple,
 ) -> "Optional[list[dict]]":
     """
-    Cartesian product of values for each known SymbolicInt: pid
-    SymbolicInts iterate over ``[0, grid[axis])``; runtime-loop
-    SymbolicInts iterate over ``range(lo, hi, step)``. Returns None if
-    any atom isn't registered in either ``pid_axes`` or
-    ``loop_var_ranges``.
+    Cartesian product of values for each known SymbolicInt: grid
+    SymbolicInts use their ``GridAxisInfo`` (which knows whether to
+    iterate over ``grid[axis]`` for tgid-style or ``grid[axis] *
+    threadgroup[axis]`` for thread_position_in_grid-style);
+    runtime-loop SymbolicInts iterate over their declared
+    ``(lo, hi, step)``. Returns None if any atom isn't registered.
     """
     if not atoms:
         return [{}]
@@ -233,10 +262,11 @@ def _enumerate_substitutions(
     for atom in sorted_atoms:
         name = atom.name
         if name in state.pid_axes:
-            axis = state.pid_axes[name]
-            if axis >= len(grid):
+            info = state.pid_axes[name]
+            try:
+                values = info.iter_values(grid, threadgroup)
+            except ValueError:
                 return None
-            values = list(range(int(grid[axis])))
         elif name in state.loop_var_ranges:
             lo, hi, step = state.loop_var_ranges[name]
             values = list(range(int(lo), int(hi), int(step)))

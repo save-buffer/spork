@@ -65,6 +65,34 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
+- **`spork.verified.kernels.matmul(M, N, K, dtype=float32)`** — the
+  canonical verified MPP matmul, tile-walking with K-loop accumulation.
+  Each call enters its own ``stile.scope()`` so dim declarations don't
+  collide across calls. Per-tile verification (ParametricReduce over
+  K-tiles folds into the spec's full-K reduction) + grid coverage.
+- **Element-level typed primitives**:
+  - ``TypedScalarValue`` — a typed scalar value (distinct from
+    ``TypedScalarTracer`` which is for slice offsets). Carries a stile
+    ``Type`` with shape ``()`` and an ``ExprType``; supports
+    ``+``/``-``/``*``/``/``/``-``.
+  - ``TypedTensorHandle.__getitem__((i, j, ...))`` returns
+    ``TypedScalarValue`` reading from the underlying device pointer
+    (math-order indices flatten to row-major).
+  - ``TypedTensorHandle.__setitem__((i, j, ...), value)`` writes via
+    the underlying device pointer AND records a per-element store
+    (Sliced(dim, idx, idx+1) per axis) into ``stored_slices`` so the
+    bind-time coverage check verifies every element is written exactly
+    once.
+  - ``skv.exp``, ``skv.sqrt``, ``skv.sin``, ``skv.cos`` — typed math
+    intrinsics on ``TypedScalarValue``; ExprType wrapped as
+    ``UnaryOp("exp"/...)``.
+- **Coverage tracking now also handles ``ThreadPositionInGrid``** (not
+  just ``ThreadgroupPositionInGrid``). Each grid-position SymbolicInt
+  is registered with a ``GridAxisInfo(axis, kind)``; ``kind="tgid"``
+  enumerates over ``grid[axis]``, ``kind="gid"`` enumerates over
+  ``grid[axis] * threadgroup[axis]``. The coverage check now takes
+  both ``grid`` and ``threadgroup`` from ``.bind()``.
+
 - **ParametricReduce on accumulating cooperative tensors**.
   ``TypedMatmulOp.run`` now snapshots its ``coop`` arg into every
   active ``skv.range`` frame; on loop exit, the wrapper walks the

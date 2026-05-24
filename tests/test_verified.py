@@ -319,3 +319,112 @@ def test_verified_matmul_rejects_wrong_kernel():
 
     with pytest.raises(ValueError, match="does not match spec"):
         _ = matmul_wrong.metal_source  # trace fires verification
+
+
+def test_skv_kernels_matmul():
+    """
+    spork.verified.kernels.matmul: the canonical verified MPP matmul,
+    end-to-end. Each call enters its own stile.scope() so per-call dim
+    declarations don't collide across tests.
+    """
+    import spork.verified.kernels as skvk
+
+    M = N = K = 128
+    np.random.seed(0)
+    A = np.random.randn(M, K).astype(np.float32)
+    B = np.random.randn(K, N).astype(np.float32)
+    C = np.zeros((M, N), dtype=np.float32)
+
+    mm = skvk.matmul(M, N, K)
+    mm(C, A, B)
+    np.testing.assert_allclose(C, A @ B, atol=1e-2, rtol=1e-2)
+
+
+def test_skv_kernels_matmul_validation():
+    """
+    skv.kernels.matmul rejects misaligned dims with a clear error.
+    """
+    import spork.verified.kernels as skvk
+
+    with pytest.raises(ValueError, match="multiple"):
+        skvk.matmul(128, 128, 100)
+    with pytest.raises(ValueError, match="multiple"):
+        skvk.matmul(120, 128, 128)
+
+
+def test_verified_elementwise_add():
+    """
+    Element-level verified kernel: each thread reads A[i], B[i], adds,
+    writes out[i]. Exercises typed pointer __getitem__/__setitem__,
+    TypedScalarValue arithmetic, per-element coverage via ThreadPositionInGrid.
+    """
+    N_size = 1024
+    N = skv.dim('N', N_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(N + N -> N)", st=(N,)))
+    def add(
+        out : skv.DevicePointer[sk.dt.float32, (N,)],
+        A   : skv.DevicePointer[sk.dt.float32, (N,)],
+        B   : skv.DevicePointer[sk.dt.float32, (N,)],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        out[i] = A[i] + B[i]
+
+    np.random.seed(0)
+    A_arr = np.random.randn(N_size).astype(np.float32)
+    B_arr = np.random.randn(N_size).astype(np.float32)
+    C_arr = np.zeros(N_size, dtype=np.float32)
+    add.bind(
+        grid=(N_size // 128, 1, 1),
+        threadgroup=(128, 1, 1),
+    )(C_arr, A_arr, B_arr)
+    np.testing.assert_allclose(C_arr, A_arr + B_arr)
+
+
+def test_verified_elementwise_add_rejects_undersized_grid():
+    """
+    Element-level kernel with grid = (4, 1, 1) and threadgroup =
+    (128, 1, 1) covers only 4*128 = 512 of 1024 positions. Coverage
+    check should reject before any GPU dispatch.
+    """
+    N_size = 1024
+    N = skv.dim('N', N_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(N + N -> N)", st=(N,)))
+    def add(
+        out : skv.DevicePointer[sk.dt.float32, (N,)],
+        A   : skv.DevicePointer[sk.dt.float32, (N,)],
+        B   : skv.DevicePointer[sk.dt.float32, (N,)],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        out[i] = A[i] + B[i]
+
+    with pytest.raises(ValueError, match="cover"):
+        add.bind(grid=(4, 1, 1), threadgroup=(128, 1, 1))
+
+
+def test_verified_elementwise_with_exp():
+    """
+    Exercises a typed math intrinsic (skv.exp) inside an element kernel.
+    Computes ``out[i] = exp(A[i])`` — the kernel's ExprType composes to
+    ``UnaryOp("exp", Tensor(N))``, matching the spec.
+    """
+    N_size = 1024
+    N = skv.dim('N', N_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("exp(N)", st=(N,)))
+    def expk(
+        out : skv.DevicePointer[sk.dt.float32, (N,)],
+        A   : skv.DevicePointer[sk.dt.float32, (N,)],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        out[i] = skv.exp(A[i])
+
+    np.random.seed(0)
+    A_arr = np.random.randn(N_size).astype(np.float32)
+    C_arr = np.zeros(N_size, dtype=np.float32)
+    expk.bind(
+        grid=(N_size // 128, 1, 1),
+        threadgroup=(128, 1, 1),
+    )(C_arr, A_arr)
+    np.testing.assert_allclose(C_arr, np.exp(A_arr), atol=1e-5, rtol=1e-5)
