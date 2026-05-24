@@ -9,17 +9,20 @@ which pulls in ``stile-verifier``. Importing ``spork.verified`` without
 stile installed raises an ImportError pointing at the right install
 command.
 
-Once stile is in place, this package will host:
+API surface (current scaffolding):
 
-  - ``spork.verified._backend`` — typed-primitive wrappers over spork's
-    tracer, mirroring how ``stile.jax`` / ``stile.triton`` wrap their
-    underlying backends.
-  - ``spork.verified.kernels`` — spec-verified analogs of
-    ``spork.kernels`` (``matmul``, ``causal_gqa``, …), proving structural
-    equivalence to a stile specification at trace time.
+  - ``skv.dim(name, size)`` — re-export of stile's dim factory.
+  - ``skv.OutputSpec(spec, st, dt=None)`` — declares the expected output.
+  - ``skv.DevicePointer[dtype, shape]`` — typed pointer parameter; the
+    shape is a tuple of stile dims.
+  - ``@skv.jit(out_spec=...)`` — verified-kernel decorator.
+  - ``skv.tensor(...)`` — wrap a spork pointer / threadgroup array as a
+    typed tensor view.
+  - ``TypedTensorHandle.assign(...)`` — fires per-tile verification.
 
-Today this module is just the import gate; the backend + verified-kernel
-contents land in follow-up changes.
+Coverage tracking across grid (proving all threadgroups together write
+every output element exactly once) is the planned follow-up; will fire
+at ``.bind(grid=...)``.
 """
 
 try:
@@ -32,3 +35,27 @@ except ImportError as e:
         "or, with uv:\n"
         "    uv add 'spork-metal[verified]'"
     ) from e
+
+
+from ._backend import (
+    DevicePointer,
+    OutputSpec,
+    TypedDevicePointerSpec,
+    dim,
+)
+from .jit import jit
+from .primitives import (
+    TypedTensorHandle,
+    tensor,
+)
+
+
+__all__ = [
+    "dim",
+    "OutputSpec",
+    "DevicePointer",
+    "TypedDevicePointerSpec",
+    "jit",
+    "tensor",
+    "TypedTensorHandle",
+]

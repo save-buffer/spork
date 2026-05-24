@@ -14,9 +14,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`spork.verified`** subpackage scaffold + **`[verified]` extra**. Installs
   ``stile-verifier`` via ``pip install 'spork-metal[verified]'``; importing
   ``spork.verified`` without that extra raises an ImportError pointing at the
-  right install command. The subpackage will host the Stile-typed primitive
-  wrappers and spec-verified analogs of ``spork.kernels`` (matmul, causal_gqa,
-  …) in follow-up changes.
+  right install command.
+- **`skv.dim`, `skv.OutputSpec`, `skv.DevicePointer[dtype, shape]`** —
+  typed kernel parameters. Shapes are tuples of stile dims declared via
+  ``skv.dim(name, size)``; the spec language is shared with stile.
+- **`@skv.jit(out_spec=...)`** — verified-kernel decorator that wraps
+  ``@sk.jit``. At trace time it walks the kernel signature, swaps each
+  typed ``DevicePointer`` annotation for the underlying spork
+  ``DevicePointerSpec``, and presents the kernel body with
+  ``TypedTensorHandle`` wrappers carrying stile ``Type`` info. Untyped
+  params (thread-position attributes) pass through unchanged.
+- **`skv.tensor`, `TypedTensorHandle`** — typed analog of
+  ``sk.tensor`` / ``TensorHandle``. ``.assign(value)`` runs
+  ``verify_types_equivalent`` (per-tile, fires at trace time, no
+  launch-param awareness — coverage tracking across grid is the
+  planned follow-up).
+
+This is the scaffolding: data structures + decorator + per-tile verify.
+Typed primitive wrappers for the rest of the spork surface (typed
+slice/matmul2d/exp/sum/threadgroup, plus the bind-time coverage check)
+land in follow-up commits.
 
 ### Added
 
