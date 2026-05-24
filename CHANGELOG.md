@@ -29,11 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ``verify_types_equivalent`` (per-tile, fires at trace time, no
   launch-param awareness — coverage tracking across grid is the
   planned follow-up).
+- **`TypedTensorHandle.slice((shape), (offsets))`**, **`TypedTileSlice`** —
+  typed slicing. The user expresses shapes/offsets in math order
+  (rows, cols, ...); the backend reverses to MPP's memory order
+  (inner first) at the spork boundary. Python-int offsets refine the
+  stile ShapeType via ``Type.slice``; symbolic (Tracer) offsets pass
+  through unrefined for now (LoopVariable bindings are the next step).
+- **`skv.matmul2d`**, **`TypedMatmulOp`**, **`TypedCooperativeTensor`** —
+  typed MPP matmul. ``op.run`` accumulates an ``einsum`` contribution
+  into the coop's stile ``Type``; ``coop.store(out_tile)`` runs
+  ``verify_types_equivalent`` against the output tile's spec. The
+  einsum string is inferred from the operands' stile dim names.
 
-This is the scaffolding: data structures + decorator + per-tile verify.
-Typed primitive wrappers for the rest of the spork surface (typed
-slice/matmul2d/exp/sum/threadgroup, plus the bind-time coverage check)
-land in follow-up commits.
+First end-to-end verified kernel works: a 64×64×64 matmul that the
+verifier accepts before any GPU dispatch, runs correctly, and rejects
+a deliberately-wrong variant (``A @ A`` instead of ``A @ B``) with a
+clear ``does not match spec`` error.
 
 ### Added
 

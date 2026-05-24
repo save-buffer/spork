@@ -45,7 +45,11 @@ from ._backend import (
 )
 from .jit import jit
 from .primitives import (
+    TypedCooperativeTensor,
+    TypedMatmulOp,
     TypedTensorHandle,
+    TypedTileSlice,
+    matmul2d,
     tensor,
 )
 
@@ -57,5 +61,9 @@ __all__ = [
     "TypedDevicePointerSpec",
     "jit",
     "tensor",
+    "matmul2d",
     "TypedTensorHandle",
+    "TypedTileSlice",
+    "TypedMatmulOp",
+    "TypedCooperativeTensor",
 ]
