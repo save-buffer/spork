@@ -46,6 +46,25 @@ verifier accepts before any GPU dispatch, runs correctly, and rejects
 a deliberately-wrong variant (``A @ A`` instead of ``A @ B``) with a
 clear ``does not match spec`` error.
 
+- **`TypedScalarTracer`** / **`TypedVectorTracer`** — typed analogs of
+  spork's scalar and vector tracers. Each carries the spork ``Tracer``
+  AND a stile ``SymbolicInt`` / ``AffineExpr``. ``@skv.jit`` auto-wraps
+  attribute params (e.g. ``Uint2[ThreadgroupPositionInGrid]``) so
+  ``bid.x``, ``bid.x * TILE``, ``bid.x * TILE + j`` all flow through
+  the verifier as symbolic affine expressions.
+- **`_slice_type`** now refines stile ``Sliced`` dims when slice
+  offsets are ``TypedScalarTracer``s — so per-tile verification on
+  tiled kernels sees the right symbolic slice (rather than passing
+  through unrefined).
+- **Tiled verified matmul works**: 128×128×64 with 4 threadgroups,
+  each handling a 64×64 output tile via ``A.slice((TM, K), (bid.y * TM,
+  0))`` etc. Verifier accepts the symbolic-offset tiles, dispatch
+  produces correct output.
+- **Required dep bump**: ``stile-verifier>=0.1.3``. The
+  ``spork.verified`` test suite now wraps each test in ``with
+  stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
+  collide across tests.
+
 ### Added
 
 - **`spork.kernels` subpackage** — a library of pre-built kernels that take

@@ -47,8 +47,10 @@ from .jit import jit
 from .primitives import (
     TypedCooperativeTensor,
     TypedMatmulOp,
+    TypedScalarTracer,
     TypedTensorHandle,
     TypedTileSlice,
+    TypedVectorTracer,
     matmul2d,
     tensor,
 )
@@ -66,4 +68,6 @@ __all__ = [
     "TypedTileSlice",
     "TypedMatmulOp",
     "TypedCooperativeTensor",
+    "TypedScalarTracer",
+    "TypedVectorTracer",
 ]

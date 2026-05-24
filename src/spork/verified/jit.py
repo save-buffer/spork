@@ -20,7 +20,14 @@ from ..jit import jit as _spork_jit
 from .. import tracer as _spork_tracer
 from ..types import DevicePointerSpec
 from ._backend import OutputSpec, TypedDevicePointerSpec, _untyped_pointer_spec
-from .primitives import TypedTensorHandle, make_output_handle, tensor as _typed_tensor
+from .primitives import (
+    TypedScalarTracer,
+    TypedTensorHandle,
+    TypedVectorTracer,
+    make_output_handle,
+    tensor as _typed_tensor,
+)
+from stile.indexing import SymbolicInt
 
 
 # Sentinel: the name of the output parameter in a verified kernel. By
@@ -100,19 +107,27 @@ def jit(
         @functools.wraps(fn)
         def inner(*tracer_args):
             # tracer_args come in the same order as the parameters; we
-            # wrap each one that has a typed annotation.
+            # wrap each one that has a typed annotation, plus auto-wrap
+            # vector/scalar grid-position attribute params so their
+            # components carry stile SymbolicInts the slice machinery
+            # can use as Sliced offsets.
             wrapped : list = []
             for (name, _param), arg in zip(params, tracer_args):
                 if name in typed_params:
                     spec = typed_params[name]
                     if name == output_name:
-                        # Output handle: ExprType seeded from the spec.
                         wrapped.append(make_output_handle(arg, out_spec))
                     else:
-                        # Input handle: bare-tensor ExprType.
                         wrapped.append(
                             _typed_tensor(arg, spec.shape, dtype=spec.dtype)
                         )
+                elif isinstance(arg, _spork_tracer.VectorTracer):
+                    wrapped.append(TypedVectorTracer(arg, var_name_prefix=name))
+                elif isinstance(arg, _spork_tracer.Tracer):
+                    wrapped.append(TypedScalarTracer(
+                        tracer=arg,
+                        sym=SymbolicInt(name=f"_{name}"),
+                    ))
                 else:
                     wrapped.append(arg)
             return fn(*wrapped)

@@ -25,6 +25,11 @@ from stile.type import (
     dim_name,
     dim_size,
 )
+from stile.indexing import (
+    AffineExpr,
+    SymbolicInt,
+    to_affine,
+)
 from stile.specification import parse_spec_into_type
 from stile.verification import verify_types_equivalent
 
@@ -235,23 +240,43 @@ class TypedTileSlice:
 def _slice_type(parent_type : Type, tile_shape, offsets) -> Type:
     """
     Compute the stile Type that results from slicing ``parent_type`` with
-    the given per-axis tile_shape and offsets. Only Python-int offsets
-    are supported in this first cut; symbolic (Tracer) offsets pass
-    through without refining the dim (the slice is still emitted, just
-    not tracked in the stile shape).
+    the given per-axis tile_shape and offsets.
+
+    Offset handling, by type:
+      - Python ``int``: refines the dim to ``Sliced(d, off, off+size)``;
+        a full-coverage int offset (0, full-size) is a no-op.
+      - ``TypedScalarTracer``: extracts the stile ``SymbolicInt`` /
+        ``AffineExpr`` from ``._sym`` and uses it as the start of the
+        Sliced dim — the verifier sees a symbolic-but-tracked slice.
+      - Raw spork ``Tracer``: passes through unrefined (we don't know
+        the symbolic identity of an arbitrary spork expression).
     """
     out = parent_type
     for parent_dim, tile_size, offset in zip(parent_type.st, tile_shape, offsets):
         parent_size = as_int(dim_size(parent_dim))
         tile_size = int(tile_size)
-        if isinstance(offset, int):
-            if offset == 0 and tile_size == parent_size:
+
+        sym_start = _offset_to_symbolic(offset)
+        if sym_start is None:
+            # Unknown symbolic; can't refine. Spork side still slices correctly.
+            continue
+        if isinstance(sym_start, int):
+            if sym_start == 0 and tile_size == parent_size:
                 continue  # full-axis slice — no Sliced wrapping needed
-            out = out.slice(dim_full_dim(parent_dim), offset, offset + tile_size)
-        # Tracer offsets: skip refinement for now. The MPP slice still
-        # emits correctly; stile just sees the parent dim until we wire
-        # LoopVariable bindings in a later patch.
+        out = out.slice(dim_full_dim(parent_dim), sym_start, sym_start + tile_size)
     return out
+
+
+def _offset_to_symbolic(offset):
+    """
+    Lower a slice offset into a stile ``SymbolicIndex`` (int /
+    SymbolicInt / AffineExpr), or None if it can't be tracked.
+    """
+    if isinstance(offset, int):
+        return offset
+    if isinstance(offset, TypedScalarTracer):
+        return offset._sym
+    return None
 
 
 # Patch TypedTensorHandle to add a .slice method without redefining the class
@@ -259,9 +284,15 @@ def _slice_type(parent_type : Type, tile_shape, offsets) -> Type:
 def _typed_slice(self, tile_shape, offsets) -> TypedTileSlice:
     # User passes tile_shape + offsets in math order (rows, cols, ...);
     # spork's slice wants MPP memory order (inner first). Reverse at the
-    # boundary so stile-side bookkeeping stays in math order.
+    # boundary so stile-side bookkeeping stays in math order. Also
+    # unwrap any TypedScalarTracer offsets to their underlying spork
+    # Tracer before handing to spork.
+    spork_offsets_math = tuple(
+        o._tracer if isinstance(o, TypedScalarTracer) else o
+        for o in offsets
+    )
     spork_tile_shape = tuple(reversed(tile_shape))
-    spork_offsets = tuple(reversed(offsets))
+    spork_offsets = tuple(reversed(spork_offsets_math))
     slice_handle = self._handle.slice(spork_tile_shape, spork_offsets)
     return TypedTileSlice(
         slice_handle=slice_handle,
@@ -436,4 +467,119 @@ def _matmul_einsum_string(a_type : Type, b_type : Type) -> tuple:
     rhs = a_only + b_only
     einstr = f"{' '.join(a_names)}, {' '.join(b_names)} -> {' '.join(rhs)}"
     return einstr, rhs
+
+
+# ---------------------------------------------------------------------------
+# Typed scalar / vector tracers — LoopVariable-aware
+# ---------------------------------------------------------------------------
+
+
+class TypedScalarTracer:
+    """
+    A spork uint scalar Tracer paired with a stile ``SymbolicInt`` or
+    ``AffineExpr``. Arithmetic ops (``* int``, ``+``, ``-``) compose on
+    both sides — the spork tracer goes into the emitted Metal, the
+    stile expression refines slice offsets the verifier can reason
+    about.
+
+    Used wherever a grid-position component (e.g. ``bid.x``) flows into
+    a slice offset or other index expression.
+    """
+
+    __slots__ = ("_tracer", "_sym")
+
+    def __init__(self, tracer : _spork_tracer.Tracer, sym):
+        self._tracer = tracer
+        self._sym = sym  # SymbolicInt | AffineExpr | int
+
+    def __mul__(self, k : int) -> "TypedScalarTracer":
+        if not isinstance(k, int):
+            raise TypeError(
+                "TypedScalarTracer can only be multiplied by a Python int "
+                f"(got {type(k).__name__}); stile AffineExprs only admit "
+                "compile-time integer coefficients."
+            )
+        return TypedScalarTracer(self._tracer * k, to_affine(self._sym) * k)
+
+    __rmul__ = __mul__
+
+    def __add__(self, other) -> "TypedScalarTracer":
+        if isinstance(other, TypedScalarTracer):
+            return TypedScalarTracer(
+                self._tracer + other._tracer,
+                to_affine(self._sym) + to_affine(other._sym),
+            )
+        if isinstance(other, int):
+            return TypedScalarTracer(
+                self._tracer + other,
+                to_affine(self._sym) + other,
+            )
+        raise TypeError(
+            f"Cannot add TypedScalarTracer + {type(other).__name__}"
+        )
+
+    __radd__ = __add__
+
+    def __sub__(self, other) -> "TypedScalarTracer":
+        if isinstance(other, TypedScalarTracer):
+            return TypedScalarTracer(
+                self._tracer - other._tracer,
+                to_affine(self._sym) - to_affine(other._sym),
+            )
+        if isinstance(other, int):
+            return TypedScalarTracer(
+                self._tracer - other,
+                to_affine(self._sym) - other,
+            )
+        raise TypeError(
+            f"Cannot subtract {type(other).__name__} from TypedScalarTracer"
+        )
+
+    def __rsub__(self, other) -> "TypedScalarTracer":
+        if isinstance(other, int):
+            return TypedScalarTracer(
+                other - self._tracer,
+                other - to_affine(self._sym),
+            )
+        raise TypeError(
+            f"Cannot subtract TypedScalarTracer from {type(other).__name__}"
+        )
+
+    def __neg__(self) -> "TypedScalarTracer":
+        return TypedScalarTracer(-self._tracer, -to_affine(self._sym))
+
+
+class TypedVectorTracer:
+    """
+    Typed wrapper around a spork ``VectorTracer`` (uint2/uint3/...).
+    Each component (``.x`` / ``.y`` / ``.z`` / ``.w``) returns a
+    ``TypedScalarTracer`` carrying a per-component ``SymbolicInt`` so
+    derived slice offsets are tracked by the verifier.
+    """
+
+    __slots__ = ("_vec", "_sym_components")
+
+    _FIELDS = ("x", "y", "z", "w")
+
+    def __init__(self, vec_tracer : _spork_tracer.VectorTracer, var_name_prefix : str):
+        self._vec = vec_tracer
+        self._sym_components : dict[str, SymbolicInt] = {}
+        for i, field in enumerate(self._FIELDS):
+            if i < self._vec._vec_size:
+                self._sym_components[field] = SymbolicInt(
+                    name=f"_{var_name_prefix}_{field}",
+                )
+
+    def __getattr__(self, name : str) -> TypedScalarTracer:
+        if name in self._FIELDS:
+            if name not in self._sym_components:
+                raise AttributeError(
+                    f"Vector of size {self._vec._vec_size} has no field "
+                    f".{name}"
+                )
+            return TypedScalarTracer(
+                tracer=getattr(self._vec, name),
+                sym=self._sym_components[name],
+            )
+        raise AttributeError(name)
 
