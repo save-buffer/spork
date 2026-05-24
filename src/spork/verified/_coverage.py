@@ -30,11 +30,20 @@ class VerifiedKernelState:
     """
     Per-kernel verifier state populated during trace; consulted at
     ``.bind(grid=..., threadgroup=...)`` for the coverage check.
+
+    ``pid_axes`` maps a grid-position SymbolicInt name → its grid-axis
+    index (so ``_bid_x → 0`` etc.).
+
+    ``loop_var_ranges`` maps a runtime-loop SymbolicInt name →
+    ``(lo, hi, step)`` Python ints describing the loop's iteration range.
+    Populated by ``skv.range`` when it's used inside the kernel body.
+    Both are enumerated during coverage check.
     """
     output_ptr_name : Optional[str] = None
     output_shape   : ShapeType = ()
     stored_slices  : List[Tuple] = field(default_factory=list)
-    pid_axes       : dict = field(default_factory=dict)  # SymbolicInt name → grid axis
+    pid_axes       : dict = field(default_factory=dict)
+    loop_var_ranges : dict = field(default_factory=dict)
 
 
 # Active state during tracing of a verified kernel. Set by
@@ -97,7 +106,7 @@ def check_coverage(state : VerifiedKernelState, grid : tuple) -> None:
         # Enumerate all (SymbolicInt → int) substitutions over their
         # registered grid ranges. If any atom isn't registered, skip
         # this store (treat as opaque-fully-covered).
-        substitutions = _enumerate_substitutions(atoms, state.pid_axes, grid)
+        substitutions = _enumerate_substitutions(atoms, state, grid)
         if substitutions is None:
             continue
 
@@ -143,22 +152,32 @@ def check_coverage(state : VerifiedKernelState, grid : tuple) -> None:
 
 def _enumerate_substitutions(
     atoms : "set[SymbolicInt]",
-    pid_axes : dict,
+    state : "VerifiedKernelState",
     grid : tuple,
 ) -> "Optional[list[dict]]":
     """
-    Cartesian product of grid-range values for each known SymbolicInt.
-    Returns None if any atom isn't registered as a pid axis.
+    Cartesian product of values for each known SymbolicInt: pid
+    SymbolicInts iterate over ``[0, grid[axis])``; runtime-loop
+    SymbolicInts iterate over ``range(lo, hi, step)``. Returns None if
+    any atom isn't registered in either ``pid_axes`` or
+    ``loop_var_ranges``.
     """
     if not atoms:
         return [{}]
     sorted_atoms = sorted(atoms, key=lambda a: a.name)
     results : list[dict] = [{}]
     for atom in sorted_atoms:
-        axis = pid_axes.get(atom.name)
-        if axis is None or axis >= len(grid):
+        name = atom.name
+        if name in state.pid_axes:
+            axis = state.pid_axes[name]
+            if axis >= len(grid):
+                return None
+            values = list(range(int(grid[axis])))
+        elif name in state.loop_var_ranges:
+            lo, hi, step = state.loop_var_ranges[name]
+            values = list(range(int(lo), int(hi), int(step)))
+        else:
             return None
-        values = list(range(int(grid[axis])))
         results = [{**s, atom: v} for s in results for v in values]
     return results
 

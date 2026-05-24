@@ -52,6 +52,7 @@ from .primitives import (
     TypedTileSlice,
     TypedVectorTracer,
     matmul2d,
+    range,
     tensor,
 )
 
@@ -64,6 +65,7 @@ __all__ = [
     "jit",
     "tensor",
     "matmul2d",
+    "range",
     "TypedTensorHandle",
     "TypedTileSlice",
     "TypedMatmulOp",

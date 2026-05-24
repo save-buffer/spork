@@ -65,6 +65,19 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
+- **Runtime loops + coverage**. ``skv.range(start, end, step)`` is the
+  verified analog of ``sk.range`` — emits a Metal ``for`` and yields a
+  ``TypedScalarTracer`` whose ``SymbolicInt`` is registered in
+  ``VerifiedKernelState.loop_var_ranges`` so the bind-time coverage
+  check enumerates over the loop's iteration range. Distinct from
+  Python's builtin ``range``: that one is the static / compile-time
+  loop (each iteration's body is traced separately, stores get
+  concrete-int offsets). Both are now supported; pick the right one for
+  the kernel's intent.
+- ``_coverage._enumerate_substitutions`` now takes the full
+  ``VerifiedKernelState`` and walks both ``pid_axes`` (grid indices)
+  and ``loop_var_ranges`` (runtime-loop indices).
+
 - **Bind-time coverage check**. ``@skv.jit`` now returns a
   ``VerifiedJittedKernel`` that records every store into the output
   during trace (with the destination's symbolic ``Sliced`` shape) and

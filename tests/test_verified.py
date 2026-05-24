@@ -165,6 +165,86 @@ def test_verified_matmul_coverage_rejects_oversized_grid():
         matmul_tiled.bind(grid=(2, 3, 1), threadgroup=(128, 1, 1))
 
 
+def test_verified_matmul_persistent_runtime_loop():
+    """
+    Persistent-M matmul: each threadgroup walks the M-axis via a
+    skv.range loop and stores one (TM, TN) tile per iteration.
+    Grid is (N/TN, 1, 1); coverage enumerates over bid.x AND the loop
+    variable. Both per-tile verification and coverage check must
+    succeed; the kernel then dispatches and matches numpy.
+    """
+    TM = TN = 64
+    M_size = 128
+    N_size = 128
+    K_size = 64
+    M = skv.dim('M', M_size)
+    N = skv.dim('N', N_size)
+    K = skv.dim('K', K_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(M K, K N -> M N)", st=(M, N)))
+    def matmul_persistent_m(
+        out : skv.DevicePointer[sk.dt.float32, (M, N)],
+        A   : skv.DevicePointer[sk.dt.float32, (M, K)],
+        B   : skv.DevicePointer[sk.dt.float32, (K, N)],
+        bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
+    ):
+        for m_idx in skv.range(M_size // TM):
+            a_tile   = A.slice((TM, K_size), (m_idx * TM, 0))
+            b_tile   = B.slice((K_size, TN), (0, bid.x * TN))
+            out_tile = out.slice((TM, TN),   (m_idx * TM, bid.x * TN))
+            op = skv.matmul2d(TM, TN, K_size, simdgroups=4)
+            coop = op.get_destination(a_tile, b_tile, sk.dt.float32)
+            op.run(a_tile, b_tile, coop)
+            coop.store(out_tile)
+
+    np.random.seed(0)
+    A_arr = np.random.randn(M_size, K_size).astype(np.float32)
+    B_arr = np.random.randn(K_size, N_size).astype(np.float32)
+    C_arr = np.zeros((M_size, N_size), dtype=np.float32)
+    matmul_persistent_m.bind(
+        grid=(N_size // TN, 1, 1),
+        threadgroup=(128, 1, 1),
+    )(C_arr, A_arr, B_arr)
+    np.testing.assert_allclose(C_arr, A_arr @ B_arr, atol=1e-2, rtol=1e-2)
+
+
+def test_verified_matmul_persistent_runtime_loop_rejects_undersized_loop():
+    """
+    Same persistent-M structure, but the loop only covers half the M
+    tiles. Coverage should reject at .bind() before any GPU dispatch.
+    """
+    TM = TN = 64
+    M_size = 128
+    N_size = 128
+    K_size = 64
+    M = skv.dim('M', M_size)
+    N = skv.dim('N', N_size)
+    K = skv.dim('K', K_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(M K, K N -> M N)", st=(M, N)))
+    def matmul_persistent_m_short(
+        out : skv.DevicePointer[sk.dt.float32, (M, N)],
+        A   : skv.DevicePointer[sk.dt.float32, (M, K)],
+        B   : skv.DevicePointer[sk.dt.float32, (K, N)],
+        bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
+    ):
+        # Bug: loops only over half of M.
+        for m_idx in skv.range(M_size // TM // 2):
+            a_tile   = A.slice((TM, K_size), (m_idx * TM, 0))
+            b_tile   = B.slice((K_size, TN), (0, bid.x * TN))
+            out_tile = out.slice((TM, TN),   (m_idx * TM, bid.x * TN))
+            op = skv.matmul2d(TM, TN, K_size, simdgroups=4)
+            coop = op.get_destination(a_tile, b_tile, sk.dt.float32)
+            op.run(a_tile, b_tile, coop)
+            coop.store(out_tile)
+
+    with pytest.raises(ValueError, match="cover"):
+        matmul_persistent_m_short.bind(
+            grid=(N_size // TN, 1, 1),
+            threadgroup=(128, 1, 1),
+        )
+
+
 def test_verified_matmul_rejects_wrong_kernel():
     """
     The verifier must reject a kernel whose expression doesn't normalize

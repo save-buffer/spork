@@ -601,3 +601,87 @@ class TypedVectorTracer:
             )
         raise AttributeError(name)
 
+
+# ---------------------------------------------------------------------------
+# Typed runtime loop
+# ---------------------------------------------------------------------------
+
+
+_loop_var_counter = [0]
+
+
+def _next_loop_var_name() -> str:
+    _loop_var_counter[0] += 1
+    return f"_loop_{_loop_var_counter[0]}"
+
+
+def range(*args):
+    """
+    Verified analog of ``sk.range``. Emits a Metal for-loop on the
+    spork side and yields a ``TypedScalarTracer`` whose stile component
+    is a fresh ``SymbolicInt`` registered with the active kernel's
+    ``loop_var_ranges``. The coverage check enumerates over the loop's
+    ``(lo, hi, step)`` range when this symbol appears in a store's
+    slice bounds.
+
+    Signatures mirror Python's ``range``:
+
+        for i in skv.range(end):                ...
+        for i in skv.range(start, end):         ...
+        for i in skv.range(start, end, step):   ...
+
+    For static (compile-time-unrolled) loops, use Python's built-in
+    ``range`` — each iteration's body is traced separately with
+    concrete-int values, and stores get recorded with concrete offsets.
+    """
+    if len(args) == 1:
+        lo, hi, step = 0, args[0], 1
+    elif len(args) == 2:
+        lo, hi, step = args[0], args[1], 1
+    elif len(args) == 3:
+        lo, hi, step = args
+    else:
+        raise TypeError(f"skv.range expects 1-3 args, got {len(args)}")
+
+    for v, label in ((lo, "lo"), (hi, "hi"), (step, "step")):
+        if not isinstance(v, int):
+            raise TypeError(
+                f"skv.range bounds must be Python ints for now (coverage "
+                f"enumeration needs concrete ranges); got {label}={v!r}"
+            )
+    return _TypedRange(lo, hi, step)
+
+
+class _TypedRange:
+    """
+    Iterator wrapper that delegates body-stmt push/pop to spork's
+    ``_RangeLoop`` while yielding a ``TypedScalarTracer`` (so slice
+    offsets composed from the loop var carry the right stile
+    ``SymbolicInt``).
+    """
+
+    __slots__ = ("_lo", "_hi", "_step")
+
+    def __init__(self, lo : int, hi : int, step : int):
+        self._lo, self._hi, self._step = lo, hi, step
+
+    def __iter__(self):
+        sk_range = _spork_tracer.range(self._lo, self._hi, self._step)
+        # Drive the spork _RangeLoop generator manually so we can wrap
+        # its yield as a typed scalar AND register the SymbolicInt with
+        # the active state.
+        spork_iter = iter(sk_range)
+        spork_tracer_var = next(spork_iter)
+        sym = SymbolicInt(name=_next_loop_var_name())
+        state = _coverage._active_state.get()
+        if state is not None:
+            state.loop_var_ranges[sym.name] = (self._lo, self._hi, self._step)
+        typed_var = TypedScalarTracer(spork_tracer_var, sym)
+        try:
+            yield typed_var
+        finally:
+            try:
+                next(spork_iter)
+            except StopIteration:
+                pass
+
