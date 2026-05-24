@@ -39,6 +39,11 @@ classifiers = [
     "Typing :: Typed",
 ]
 
+[project.optional-dependencies]
+verified = [
+    "stile-verifier>=0.1.2",
+]
+
 [project.urls]
 Homepage      = "https://github.com/save-buffer/spork"
 Repository    = "https://github.com/save-buffer/spork"

@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`spork.verified`** subpackage scaffold + **`[verified]` extra**. Installs
+  ``stile-verifier`` via ``pip install 'spork-metal[verified]'``; importing
+  ``spork.verified`` without that extra raises an ImportError pointing at the
+  right install command. The subpackage will host the Stile-typed primitive
+  wrappers and spec-verified analogs of ``spork.kernels`` (matmul, causal_gqa,
+  …) in follow-up changes.
+
+### Added
+
 - **`spork.kernels` subpackage** — a library of pre-built kernels that take
   the relevant compile-time dimensions/parameters, generate a specialized
   kernel, compute the launch geometry, and return a callable with the
