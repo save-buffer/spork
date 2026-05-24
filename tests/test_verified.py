@@ -245,6 +245,53 @@ def test_verified_matmul_persistent_runtime_loop_rejects_undersized_loop():
         )
 
 
+def test_verified_matmul_k_loop():
+    """
+    K-loop matmul: each threadgroup computes one (TM, TN) output tile
+    by accumulating over K-chunks via skv.range. The verifier must
+    recognize that ParametricReduce-over-K-tiles equals the spec's
+    full-K reduction (interval-merging on sum reductions).
+    """
+    TM = TN = 64
+    TK = 64
+    M_size = N_size = 128
+    K_size = 128
+    M = skv.dim('M', M_size)
+    N = skv.dim('N', N_size)
+    K = skv.dim('K', K_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(M K, K N -> M N)", st=(M, N)))
+    def matmul_k_loop(
+        out : skv.DevicePointer[sk.dt.float32, (M, N)],
+        A   : skv.DevicePointer[sk.dt.float32, (M, K)],
+        B   : skv.DevicePointer[sk.dt.float32, (K, N)],
+        bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
+    ):
+        op = skv.matmul2d(TM, TN, TK, simdgroups=4)
+        out_tile = out.slice((TM, TN), (bid.y * TM, bid.x * TN))
+        # Allocate the accumulator using the first K-tile for type
+        # inference (its concrete slice doesn't matter — coop starts
+        # at zero anyway).
+        a_seed = A.slice((TM, TK), (bid.y * TM, 0))
+        b_seed = B.slice((TK, TN), (0, bid.x * TN))
+        coop = op.get_destination(a_seed, b_seed, sk.dt.float32)
+        for k_idx in skv.range(K_size // TK):
+            a_tile = A.slice((TM, TK), (bid.y * TM, k_idx * TK))
+            b_tile = B.slice((TK, TN), (k_idx * TK, bid.x * TN))
+            op.run(a_tile, b_tile, coop)
+        coop.store(out_tile)
+
+    np.random.seed(0)
+    A_arr = np.random.randn(M_size, K_size).astype(np.float32)
+    B_arr = np.random.randn(K_size, N_size).astype(np.float32)
+    C_arr = np.zeros((M_size, N_size), dtype=np.float32)
+    matmul_k_loop.bind(
+        grid=(N_size // TN, M_size // TM, 1),
+        threadgroup=(128, 1, 1),
+    )(C_arr, A_arr, B_arr)
+    np.testing.assert_allclose(C_arr, A_arr @ B_arr, atol=1e-2, rtol=1e-2)
+
+
 def test_verified_matmul_rejects_wrong_kernel():
     """
     The verifier must reject a kernel whose expression doesn't normalize

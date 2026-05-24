@@ -426,12 +426,15 @@ class TypedMatmulOp:
         """
         Accumulate ``a @ b`` into ``coop``. Stile type:
         ``coop.type = coop.type + einsum(a, b)``.
+
+        If we're inside one or more ``skv.range`` loops, snapshot
+        ``coop``'s pre-mutation type into each loop's snapshots so the
+        loop-exit wrap can compute the per-iter delta and emit a
+        ``ParametricReduce``.
         """
+        _coverage.on_coop_touched(coop)
         einstr, _ = _matmul_einsum_string(a.type, b.type)
         contribution = t.einsum(a.type, b.type, einstr)
-        # If coop is currently zero, replace with the contribution; else
-        # add. (Constant(0) + x == x after normalize, but skipping the
-        # rebuild keeps the ExprType cleaner.)
         if isinstance(coop._type.et, Constant) and coop._type.et.value == 0.0:
             coop._type = contribution
         else:
@@ -668,20 +671,29 @@ class _TypedRange:
     def __iter__(self):
         sk_range = _spork_tracer.range(self._lo, self._hi, self._step)
         # Drive the spork _RangeLoop generator manually so we can wrap
-        # its yield as a typed scalar AND register the SymbolicInt with
-        # the active state.
+        # its yield as a typed scalar AND push an ActiveLoop frame for
+        # accumulator snapshotting.
         spork_iter = iter(sk_range)
         spork_tracer_var = next(spork_iter)
         sym = SymbolicInt(name=_next_loop_var_name())
         state = _coverage._active_state.get()
         if state is not None:
             state.loop_var_ranges[sym.name] = (self._lo, self._hi, self._step)
+        loop = _coverage.ActiveLoop(
+            sym=sym, lo=self._lo, hi=self._hi, step=self._step,
+        )
+        _coverage._active_loops.append(loop)
         typed_var = TypedScalarTracer(spork_tracer_var, sym)
         try:
             yield typed_var
         finally:
+            # 1) Finalize spork's for-loop body (close the Metal scope).
             try:
                 next(spork_iter)
             except StopIteration:
                 pass
+            # 2) Pop the active loop and wrap any accumulators that
+            #    were touched in this body as ParametricReduce.
+            popped = _coverage._active_loops.pop()
+            _coverage.wrap_loop_accumulators(popped)
 

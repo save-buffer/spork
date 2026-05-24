@@ -65,6 +65,20 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
+- **ParametricReduce on accumulating cooperative tensors**.
+  ``TypedMatmulOp.run`` now snapshots its ``coop`` arg into every
+  active ``skv.range`` frame; on loop exit, the wrapper walks the
+  snapshots and replaces each touched coop's type with
+  ``snap + ParametricReduce(sym, lo, hi, "sum", delta)``. Stile's
+  normalize folds the ``Constant(0) + ParametricReduce(...)`` case to
+  the bare reduction, so a K-tile accumulating matmul verifies against
+  the full-K spec without any user-side annotation.
+- **End-to-end verified K-loop matmul** (in tests): each threadgroup
+  computes one ``(TM, TN)`` output tile by accumulating ``op.run`` over
+  K-chunks via ``skv.range``. Verifier accepts the per-tile
+  ``ParametricReduce`` as equivalent to the spec's full-K reduction,
+  coverage check accepts the grid, dispatch matches numpy.
+
 - **Runtime loops + coverage**. ``skv.range(start, end, step)`` is the
   verified analog of ``sk.range`` — emits a Metal ``for`` and yields a
   ``TypedScalarTracer`` whose ``SymbolicInt`` is registered in

@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from stile.indexing import AffineExpr, SymbolicInt, to_affine
-from stile.type import Sliced, ShapeType
+from stile.type import BinaryOp, ParametricReduce, Sliced, ShapeType, Type
 
 
 @dataclass
@@ -52,6 +52,70 @@ class VerifiedKernelState:
 _active_state : contextvars.ContextVar[Optional[VerifiedKernelState]] = (
     contextvars.ContextVar("_skv_active_state", default=None)
 )
+
+
+# ---------------------------------------------------------------------------
+# Active-loop stack — for ParametricReduce wrapping of accumulators
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ActiveLoop:
+    """
+    A live ``skv.range`` loop. ``snapshots`` maps each typed cooperative
+    tensor first touched in this loop's body → its ``Type`` at the
+    moment of first touch (i.e. just before the body's first
+    contribution applied).
+    """
+    sym  : SymbolicInt
+    lo   : int
+    hi   : int
+    step : int
+    snapshots : dict = field(default_factory=dict)
+
+
+# Stack of active runtime loops. Pushed by ``skv.range`` on body entry,
+# popped on body exit; the ``primitives`` module consults this for
+# accumulator snapshotting.
+_active_loops : List[ActiveLoop] = []
+
+
+def on_coop_touched(coop) -> None:
+    """
+    Called by typed accumulating ops (e.g. ``TypedMatmulOp.run``) before
+    they mutate a ``TypedCooperativeTensor``. For every loop on the
+    stack that hasn't yet snapshotted this coop, record its current
+    type — that's the type we'll need on loop exit to compute the
+    per-iter delta.
+    """
+    for loop in _active_loops:
+        if id(coop) not in loop.snapshots:
+            loop.snapshots[id(coop)] = (coop, coop._type)
+
+
+def wrap_loop_accumulators(loop : ActiveLoop) -> None:
+    """
+    Called at the end of a ``skv.range`` body (after the spork-side
+    ForLoop has been finalized). For each coop that was touched
+    during the body, replace its type with
+    ``snap + ParametricReduce(sym, lo, hi, "sum", delta)`` where
+    ``delta = current_type - snap``. Stile's normalize then folds the
+    Constant(0)/zero-init case to just the ParametricReduce.
+    """
+    for coop, snap_type in loop.snapshots.values():
+        delta_et = BinaryOp(op="-", lhs=coop._type.et, rhs=snap_type.et)
+        wrapped_et = BinaryOp(
+            op="+",
+            lhs=snap_type.et,
+            rhs=ParametricReduce(
+                loop_var=loop.sym,
+                lo=loop.lo,
+                hi=loop.hi,
+                op="sum",
+                body=delta_et,
+            ),
+        )
+        coop._type = Type(st=coop._type.st, et=wrapped_et, dt=coop._type.dt)
 
 
 def record_store(output_handle, sliced_shape : ShapeType) -> None:
