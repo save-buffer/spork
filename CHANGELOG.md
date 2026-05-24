@@ -65,6 +65,20 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
+- **Bind-time coverage check**. ``@skv.jit`` now returns a
+  ``VerifiedJittedKernel`` that records every store into the output
+  during trace (with the destination's symbolic ``Sliced`` shape) and
+  registers each grid-position SymbolicInt against its grid axis.
+  Calling ``.bind(grid, threadgroup)`` substitutes those symbolic
+  bounds over the grid range, unions per-axis intervals, and raises
+  ``ValueError`` if the union doesn't equal each declared output dim's
+  full extent. Catches:
+    - undersized grid (positions left unwritten),
+    - oversized grid (overlapping or out-of-bounds writes),
+    - off-by-one constant offsets,
+  all before any GPU work is dispatched. Mirrors
+  ``stile.triton._core._check_coverage_at_launch``.
+
 ### Added
 
 - **`spork.kernels` subpackage** — a library of pre-built kernels that take

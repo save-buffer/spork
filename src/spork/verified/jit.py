@@ -3,23 +3,33 @@
 
 Wraps ``@sk.jit`` so that during the kernel's trace, parameters declared
 as ``skv.DevicePointer[dtype, shape]`` are presented to the kernel body
-as ``TypedTensorHandle`` instances. Untyped params (thread-position
-attributes, plain scalars) pass through unchanged.
+as ``TypedTensorHandle`` instances and grid-position attribute params
+(``Uint2[ThreadgroupPositionInGrid]`` etc.) are presented as
+``TypedVectorTracer`` / ``TypedScalarTracer`` whose components carry
+stile ``SymbolicInt``s registered against their grid axis.
 
 Per-tile verification fires when the kernel calls ``tOut.assign(...)``
-on its typed output handle. Coverage tracking — proving that all
-threadgroups together write every output element exactly once — fires
-later at ``.bind(grid=..., threadgroup=...)`` (follow-up work).
+or ``coop.store(out_tile)``. Bind-time coverage verification — proving
+the union of per-store slices across all grid threadgroups covers the
+declared output shape exactly once — fires at ``.bind(grid=...,
+threadgroup=...)``.
 """
 
 import functools
 import inspect
 from typing import Callable, Optional
 
-from ..jit import jit as _spork_jit
+from stile.indexing import SymbolicInt
+
+from ..jit import BoundKernel, jit as _spork_jit
 from .. import tracer as _spork_tracer
-from ..types import DevicePointerSpec
+from ..types import (
+    DevicePointerSpec,
+    ScalarParamSpec,
+    ThreadgroupPositionInGrid,
+)
 from ._backend import OutputSpec, TypedDevicePointerSpec, _untyped_pointer_spec
+from . import _coverage
 from .primitives import (
     TypedScalarTracer,
     TypedTensorHandle,
@@ -27,14 +37,57 @@ from .primitives import (
     make_output_handle,
     tensor as _typed_tensor,
 )
-from stile.indexing import SymbolicInt
 
 
-# Sentinel: the name of the output parameter in a verified kernel. By
-# convention, the first parameter is the output (matches the rest of
-# spork). Subclasses / future versions may want a more explicit
-# annotation; for now we just take param 0.
+# Attribute classes whose component values genuinely correspond to grid
+# axes — i.e. they vary per-threadgroup-or-thread and partition the
+# global work. For coverage tracking we only enumerate over these.
+_GRID_ATTRS = (ThreadgroupPositionInGrid,)
+
+
 _OUTPUT_PARAM_INDEX = 0
+
+
+class VerifiedJittedKernel:
+    """
+    Wraps a spork ``JittedKernel`` with the verified-kernel state
+    captured during trace. ``.bind(grid, threadgroup)`` runs the
+    bind-time coverage check before producing a ``BoundKernel``.
+
+    Otherwise proxies the underlying kernel transparently
+    (``.metal_source``, ``.source_map``, etc.).
+    """
+
+    __slots__ = ("_kernel", "_state")
+
+    def __init__(self, kernel, state : _coverage.VerifiedKernelState):
+        self._kernel = kernel
+        self._state = state
+
+    def bind(self, grid, threadgroup) -> BoundKernel:
+        # Ensure we have a trace (and thus stored_slices populated).
+        self._kernel._ensure_compiled()
+        _coverage.check_coverage(self._state, tuple(int(x) for x in grid))
+        return self._kernel.bind(grid, threadgroup)
+
+    def __getitem__(self, dispatch_spec):
+        # Skip the coverage check when launched via subscript — the
+        # subscript form goes through spork's normal _Launcher; users
+        # who want coverage should call .bind explicitly. (We can
+        # tighten this later if it's noisy.)
+        return self._kernel[dispatch_spec]
+
+    @property
+    def metal_source(self) -> str:
+        return self._kernel.metal_source
+
+    @property
+    def source_map(self):
+        return self._kernel.source_map
+
+    @property
+    def name(self) -> str:
+        return self._kernel.name
 
 
 def jit(
@@ -54,10 +107,9 @@ def jit(
             B   : skv.DevicePointer[sk.dt.float32, (K, N)],
             bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
         ):
-            tA = skv.tensor(A)
-            tB = skv.tensor(B)
-            # ... compute `result` (a TypedTensorHandle or typed value) ...
-            out.assign(result)
+            ...
+            out.assign(result)   # per-tile verification
+            # → .bind(grid=..., tg=...) verifies grid covers the output
 
     ``output_param`` may name the parameter that's the verified output;
     defaults to the first parameter.
@@ -83,11 +135,8 @@ def jit(
                     f"named {output_name!r}"
                 )
 
-        # Walk the annotations and build a substitution table mapping
-        # parameter name → (untyped-spec-to-pass-to-sk.jit, stile-shape).
-        # We replace each typed annotation with the underlying spork
-        # DevicePointerSpec before sk.jit sees it.
-        typed_params : dict = {}  # name → TypedDevicePointerSpec
+        # Per-parameter typed-spec table.
+        typed_params : dict = {}
         for name, param in params:
             ann = param.annotation
             if isinstance(ann, TypedDevicePointerSpec):
@@ -100,17 +149,31 @@ def jit(
                 "skv.DevicePointer[dtype, shape]"
             )
 
-        # Build the kernel function that sk.jit will see: same signature
-        # as the user's, but with typed annotations replaced by plain
-        # sk.DevicePointer specs, and wrapping incoming spork PointerTracer
-        # values as TypedTensorHandles before delegating to the user body.
+        # Identify grid-position attribute params and figure out which
+        # vector component → which grid axis. For
+        # ``bid : Uint2[ThreadgroupPositionInGrid]``, vector
+        # components (x, y, z) map to grid axes (0, 1, 2).
+        grid_param_components : dict[str, list[str]] = {}
+        for name, param in params:
+            ann = param.annotation
+            if isinstance(ann, ScalarParamSpec) and ann.attribute is not None:
+                if any(issubclass(ann.attribute, A) for A in _GRID_ATTRS):
+                    if ann.vec_size > 1:
+                        components = ["x", "y", "z", "w"][:ann.vec_size]
+                    else:
+                        components = [None]
+                    grid_param_components[name] = components
+
+        # State that lives across the trace and feeds .bind's coverage
+        # check. Populated by the wrapper below + `record_store` calls
+        # during `coop.store` / `.assign`.
+        state = _coverage.VerifiedKernelState(
+            output_ptr_name=output_name,
+            output_shape=out_spec.st,
+        )
+
         @functools.wraps(fn)
         def inner(*tracer_args):
-            # tracer_args come in the same order as the parameters; we
-            # wrap each one that has a typed annotation, plus auto-wrap
-            # vector/scalar grid-position attribute params so their
-            # components carry stile SymbolicInts the slice machinery
-            # can use as Sliced offsets.
             wrapped : list = []
             for (name, _param), arg in zip(params, tracer_args):
                 if name in typed_params:
@@ -122,26 +185,35 @@ def jit(
                             _typed_tensor(arg, spec.shape, dtype=spec.dtype)
                         )
                 elif isinstance(arg, _spork_tracer.VectorTracer):
-                    wrapped.append(TypedVectorTracer(arg, var_name_prefix=name))
+                    typed_vec = TypedVectorTracer(arg, var_name_prefix=name)
+                    if name in grid_param_components:
+                        # Register each component's SymbolicInt → grid axis.
+                        for axis, comp in enumerate(grid_param_components[name]):
+                            if comp is None:
+                                continue
+                            sym = typed_vec._sym_components[comp]
+                            state.pid_axes[sym.name] = axis
+                    wrapped.append(typed_vec)
                 elif isinstance(arg, _spork_tracer.Tracer):
-                    wrapped.append(TypedScalarTracer(
-                        tracer=arg,
-                        sym=SymbolicInt(name=f"_{name}"),
-                    ))
+                    sym = SymbolicInt(name=f"_{name}")
+                    if name in grid_param_components:
+                        state.pid_axes[sym.name] = 0
+                    wrapped.append(TypedScalarTracer(tracer=arg, sym=sym))
                 else:
                     wrapped.append(arg)
-            return fn(*wrapped)
+            token = _coverage._active_state.set(state)
+            try:
+                return fn(*wrapped)
+            finally:
+                _coverage._active_state.reset(token)
 
-        # Construct the underlying spork-jitted kernel. We have to swap
-        # the typed annotations out of inner's signature so spork's own
-        # parameter-spec dispatch (which expects DevicePointerSpec) is
-        # happy.
         inner.__signature__ = sig.replace(parameters=[
             param.replace(annotation=_untyped_pointer_spec(typed_params[name]))
             if name in typed_params else param
             for name, param in params
         ])
 
-        return _spork_jit(inner)
+        jitted = _spork_jit(inner)
+        return VerifiedJittedKernel(jitted, state)
 
     return decorator

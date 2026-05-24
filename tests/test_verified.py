@@ -95,6 +95,76 @@ def test_verified_matmul_tiled_symbolic_offsets():
     np.testing.assert_allclose(C_arr, A_arr @ B_arr, atol=1e-2, rtol=1e-2)
 
 
+def test_verified_matmul_coverage_rejects_undersized_grid():
+    """
+    Tiled matmul whose grid only covers half the output (M-axis grid =
+    1 instead of 2) should be rejected at .bind() before any GPU
+    dispatch, with a clear coverage error.
+    """
+    TM = TN = 64
+    M_size = 128
+    N_size = 128
+    K_size = 64
+    M = skv.dim('M', M_size)
+    N = skv.dim('N', N_size)
+    K = skv.dim('K', K_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(M K, K N -> M N)", st=(M, N)))
+    def matmul_tiled(
+        out : skv.DevicePointer[sk.dt.float32, (M, N)],
+        A   : skv.DevicePointer[sk.dt.float32, (M, K)],
+        B   : skv.DevicePointer[sk.dt.float32, (K, N)],
+        bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
+    ):
+        a_tile   = A.slice((TM, K_size),   (bid.y * TM, 0))
+        b_tile   = B.slice((K_size, TN),   (0, bid.x * TN))
+        out_tile = out.slice((TM, TN),     (bid.y * TM, bid.x * TN))
+        op = skv.matmul2d(TM, TN, K_size, simdgroups=4)
+        coop = op.get_destination(a_tile, b_tile, sk.dt.float32)
+        op.run(a_tile, b_tile, coop)
+        coop.store(out_tile)
+
+    # Grid (N/TN, M/TM, 1) = (2, 2, 1) would be correct.
+    # Use (2, 1, 1) — only writes the top half of M.
+    with pytest.raises(ValueError, match="cover"):
+        matmul_tiled.bind(grid=(2, 1, 1), threadgroup=(128, 1, 1))
+
+
+def test_verified_matmul_coverage_rejects_oversized_grid():
+    """
+    Oversized grid (overlapping writes) should also be rejected — every
+    output position should be written exactly once, not multiple times.
+    """
+    TM = TN = 64
+    M_size = 128
+    N_size = 128
+    K_size = 64
+    M = skv.dim('M', M_size)
+    N = skv.dim('N', N_size)
+    K = skv.dim('K', K_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(M K, K N -> M N)", st=(M, N)))
+    def matmul_tiled(
+        out : skv.DevicePointer[sk.dt.float32, (M, N)],
+        A   : skv.DevicePointer[sk.dt.float32, (M, K)],
+        B   : skv.DevicePointer[sk.dt.float32, (K, N)],
+        bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
+    ):
+        a_tile   = A.slice((TM, K_size),   (bid.y * TM, 0))
+        b_tile   = B.slice((K_size, TN),   (0, bid.x * TN))
+        out_tile = out.slice((TM, TN),     (bid.y * TM, bid.x * TN))
+        op = skv.matmul2d(TM, TN, K_size, simdgroups=4)
+        coop = op.get_destination(a_tile, b_tile, sk.dt.float32)
+        op.run(a_tile, b_tile, coop)
+        coop.store(out_tile)
+
+    # Grid (2, 3, 1) overruns the M axis: bid.y ∈ {0, 1, 2} writes
+    # tiles at M-offsets {0, 64, 128} but M only has 128 elements
+    # (offset 128 walks off the end).
+    with pytest.raises(ValueError, match="cover"):
+        matmul_tiled.bind(grid=(2, 3, 1), threadgroup=(128, 1, 1))
+
+
 def test_verified_matmul_rejects_wrong_kernel():
     """
     The verifier must reject a kernel whose expression doesn't normalize

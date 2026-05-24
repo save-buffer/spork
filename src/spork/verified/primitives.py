@@ -35,6 +35,7 @@ from stile.verification import verify_types_equivalent
 
 from .. import dtypes as dt
 from .. import tracer as _spork_tracer
+from . import _coverage
 from ._backend import OutputSpec
 
 
@@ -44,17 +45,24 @@ class TypedTensorHandle:
 
     The wrapped ``TensorHandle`` is what spork's codegen and MPP ops
     operate on; the ``Type`` is what the verifier sees.
+
+    ``_is_output`` flags the kernel's verified output. Set by
+    ``make_output_handle``; propagated through ``.slice`` to the
+    resulting ``TypedTileSlice`` so ``.assign`` / ``.store`` know to
+    record their writes for the bind-time coverage check.
     """
 
-    __slots__ = ("_handle", "_type")
+    __slots__ = ("_handle", "_type", "_is_output")
 
     def __init__(
         self,
-        handle : _spork_tracer.TensorHandle,
-        type   : Type,
+        handle    : _spork_tracer.TensorHandle,
+        type      : Type,
+        is_output : bool = False,
     ):
         self._handle = handle
         self._type = type
+        self._is_output = is_output
 
     @property
     def type(self) -> Type:
@@ -87,6 +95,8 @@ class TypedTensorHandle:
                 f"  Expected: {self._type.et}\n"
                 f"  Actual  : {value._type.et}"
             )
+        if self._is_output:
+            _coverage.record_store(self, self._type.st)
 
 
 class _ValueTyped:
@@ -198,6 +208,7 @@ def make_output_handle(
     return TypedTensorHandle(
         handle=handle,
         type=Type(st=spec.st, et=spec_type.et, dt=output_dtype),
+        is_output=True,
     )
 
 
@@ -219,18 +230,22 @@ class TypedTileSlice:
     """
     A typed analog of spork's ``TileSlice`` — opaque to the MPP runtime,
     but carries a stile ``Type`` so downstream typed ops compose into a
-    verifiable expression.
+    verifiable expression. ``_is_output`` propagates from the parent
+    ``TypedTensorHandle`` so ``coop.store(out_tile)`` knows to record
+    the write for the coverage check.
     """
 
-    __slots__ = ("_slice", "_type")
+    __slots__ = ("_slice", "_type", "_is_output")
 
     def __init__(
         self,
         slice_handle : _spork_tracer.TileSlice,
         type         : Type,
+        is_output    : bool = False,
     ):
         self._slice = slice_handle
         self._type = type
+        self._is_output = is_output
 
     @property
     def type(self) -> Type:
@@ -297,6 +312,7 @@ def _typed_slice(self, tile_shape, offsets) -> TypedTileSlice:
     return TypedTileSlice(
         slice_handle=slice_handle,
         type=_slice_type(self._type, tile_shape, offsets),
+        is_output=self._is_output,
     )
 
 
@@ -349,6 +365,8 @@ class TypedCooperativeTensor:
                 f"  Expected: {out_tile._type.et}\n"
                 f"  Actual  : {self._type.et}"
             )
+        if out_tile._is_output:
+            _coverage.record_store(out_tile, out_tile._type.st)
         self._coop.store(out_tile._slice)
 
 
