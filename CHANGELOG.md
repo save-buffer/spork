@@ -65,6 +65,20 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
+- **`skv.local(dtype, init)`** + ``TypedLocal`` — typed mutable scalar
+  locals. ``TypedLocal`` subclasses ``TypedScalarValue`` (inherits
+  reads + arithmetic) and adds ``.assign(value)``, ``+=``, ``-=``,
+  ``*=``, ``/=``. Underlying spork ``Local`` is what actually mutates;
+  the typed wrapper tracks the current value's ExprType for downstream
+  reads.
+- **`skv.threadgroup(dtype, shape)`** + ``TypedThreadgroupArray`` —
+  typed wrapper around ``sk.threadgroup``. Reads return
+  ``TypedScalarValue`` whose ExprType is a Tensor leaf with the
+  array's declared dim tuple (so verification through intermediate
+  scratch sees a sensible expression). Writes pass through. Compatible
+  with ``skv.tensor(...)`` wrapping for MPP-cooperative-tensor stores
+  into threadgroup scratch.
+
 - **`spork.verified.kernels.matmul(M, N, K, dtype=float32)`** — the
   canonical verified MPP matmul, tile-walking with K-loop accumulation.
   Each call enters its own ``stile.scope()`` so dim declarations don't

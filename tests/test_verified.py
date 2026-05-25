@@ -428,3 +428,66 @@ def test_verified_elementwise_with_exp():
         threadgroup=(128, 1, 1),
     )(C_arr, A_arr)
     np.testing.assert_allclose(C_arr, np.exp(A_arr), atol=1e-5, rtol=1e-5)
+
+
+def test_verified_typed_local_accumulator():
+    """
+    skv.local: per-thread typed accumulator. Computes A + B by
+    initializing a local to A[i] then += B[i].
+    """
+    N_size = 1024
+    N = skv.dim('N', N_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(N + N -> N)", st=(N,)))
+    def add_via_local(
+        out : skv.DevicePointer[sk.dt.float32, (N,)],
+        A   : skv.DevicePointer[sk.dt.float32, (N,)],
+        B   : skv.DevicePointer[sk.dt.float32, (N,)],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        acc = skv.local(sk.dt.float32, A[i])
+        acc += B[i]
+        out[i] = acc
+
+    np.random.seed(0)
+    A_arr = np.random.randn(N_size).astype(np.float32)
+    B_arr = np.random.randn(N_size).astype(np.float32)
+    C_arr = np.zeros(N_size, dtype=np.float32)
+    add_via_local.bind(
+        grid=(N_size // 128, 1, 1),
+        threadgroup=(128, 1, 1),
+    )(C_arr, A_arr, B_arr)
+    np.testing.assert_allclose(C_arr, A_arr + B_arr)
+
+
+def test_verified_typed_threadgroup_array():
+    """
+    skv.threadgroup: a typed threadgroup-memory scratch array. Each
+    thread writes A[i] + B[i] into scratch, then reads its own slot
+    back into the output (exercises typed [] read/write).
+    """
+    TGROUP = 128
+    N_size = TGROUP
+    N = skv.dim('N', N_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(N + N -> N)", st=(N,)))
+    def add_via_tg(
+        out : skv.DevicePointer[sk.dt.float32, (N,)],
+        A   : skv.DevicePointer[sk.dt.float32, (N,)],
+        B   : skv.DevicePointer[sk.dt.float32, (N,)],
+        i   : sk.Uint[sk.ThreadPositionInGrid],
+    ):
+        scratch = skv.threadgroup(sk.dt.float32, (N,))
+        scratch[i] = A[i] + B[i]
+        sk.threadgroup_barrier()
+        out[i] = scratch[i]
+
+    np.random.seed(0)
+    A_arr = np.random.randn(N_size).astype(np.float32)
+    B_arr = np.random.randn(N_size).astype(np.float32)
+    C_arr = np.zeros(N_size, dtype=np.float32)
+    add_via_tg.bind(
+        grid=(1, 1, 1),
+        threadgroup=(TGROUP, 1, 1),
+    )(C_arr, A_arr, B_arr)
+    np.testing.assert_allclose(C_arr, A_arr + B_arr)

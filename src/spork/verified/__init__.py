@@ -46,19 +46,23 @@ from ._backend import (
 from .jit import jit
 from .primitives import (
     TypedCooperativeTensor,
+    TypedLocal,
     TypedMatmulOp,
     TypedScalarTracer,
     TypedScalarValue,
     TypedTensorHandle,
+    TypedThreadgroupArray,
     TypedTileSlice,
     TypedVectorTracer,
     cos,
     exp,
+    local,
     matmul2d,
     range,
     sin,
     sqrt,
     tensor,
+    threadgroup,
 )
 
 
@@ -73,6 +77,8 @@ __all__ = [
     "range",
     "exp", "sqrt", "sin", "cos",
     "TypedScalarValue",
+    "local", "TypedLocal",
+    "threadgroup", "TypedThreadgroupArray",
     "TypedTensorHandle",
     "TypedTileSlice",
     "TypedMatmulOp",

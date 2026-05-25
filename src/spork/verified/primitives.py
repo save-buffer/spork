@@ -939,3 +939,196 @@ def sin(x : TypedScalarValue) -> TypedScalarValue:
 def cos(x : TypedScalarValue) -> TypedScalarValue:
     return _math_intrinsic(_spork_tracer.cos, "cos", x)
 
+
+# ---------------------------------------------------------------------------
+# Typed mutable local scalars
+# ---------------------------------------------------------------------------
+
+
+class TypedLocal(TypedScalarValue):
+    """
+    A typed mutable local scalar — wraps a spork ``Local`` (from
+    ``sk.local``) with a stile ``Type`` that updates on each assign /
+    compound assign.
+
+    Reads compose like ``TypedScalarValue`` (inherits ``+``/``*``/etc.).
+    The underlying spork ``Local`` is what the kernel actually mutates;
+    this typed wrapper just tracks the current value's stile expression
+    alongside, so downstream reads carry the right ExprType.
+    """
+
+    __slots__ = ("_spork_local", "_dtype")
+
+    def __init__(
+        self,
+        spork_local : _spork_tracer.Local,
+        dtype       : dt.Dtype,
+        init_et,
+    ):
+        super().__init__(
+            tracer=spork_local,
+            type=Type(st=(), et=init_et, dt=dtype),
+        )
+        self._spork_local = spork_local
+        self._dtype = dtype
+
+    def _assigned_et(self, value):
+        if isinstance(value, TypedScalarValue):
+            return value._type.et
+        if isinstance(value, TypedScalarTracer):
+            return Constant(0.0)
+        if isinstance(value, (int, float)):
+            return Constant(float(value))
+        raise TypeError(f"Can't assign {type(value).__name__} to TypedLocal")
+
+    def _value_tracer(self, value):
+        if isinstance(value, (TypedScalarValue, TypedScalarTracer)):
+            return value._tracer
+        return value
+
+    def assign(self, value) -> None:
+        """
+        Re-assign the local to ``value``. Updates both spork-side
+        emission and the typed wrapper's current ExprType.
+        """
+        self._spork_local.assign(self._value_tracer(value))
+        self._type = Type(st=(), et=self._assigned_et(value), dt=self._dtype)
+
+    def _iaccum(self, op : str, value) -> "TypedLocal":
+        self._spork_local._update(op, self._value_tracer(value))
+        new_et = BinaryOp(
+            op=op.rstrip("="),  # "+=" → "+"
+            lhs=self._type.et,
+            rhs=self._assigned_et(value),
+        )
+        self._type = Type(st=(), et=new_et, dt=self._dtype)
+        return self
+
+    def __iadd__(self, other): return self._iaccum("+=", other)
+    def __isub__(self, other): return self._iaccum("-=", other)
+    def __imul__(self, other): return self._iaccum("*=", other)
+    def __itruediv__(self, other): return self._iaccum("/=", other)
+
+
+def local(dtype : dt.Dtype, init) -> TypedLocal:
+    """
+    Allocate a typed mutable local scalar initialized to ``init``.
+
+    Emits ``<dtype> v = init;`` on the spork side and returns a
+    ``TypedLocal`` that supports reads (composes via inherited
+    ``TypedScalarValue`` arithmetic) and writes (``.assign``, ``+=``,
+    ``-=``, ``*=``, ``/=``).
+    """
+    init_tracer = init._tracer if isinstance(init, (TypedScalarValue, TypedScalarTracer)) else init
+    spork_local = _spork_tracer.local(dtype, init_tracer)
+    init_et = (
+        init._type.et if isinstance(init, TypedScalarValue)
+        else Constant(0.0) if isinstance(init, TypedScalarTracer)
+        else Constant(float(init))
+    )
+    return TypedLocal(spork_local, dtype, init_et)
+
+
+# ---------------------------------------------------------------------------
+# Typed threadgroup-memory arrays
+# ---------------------------------------------------------------------------
+
+
+class TypedThreadgroupArray:
+    """
+    A typed wrapper around ``sk.threadgroup`` — a fixed-size array in
+    threadgroup-shared memory, indexable via ``[i]`` or ``[i, j, ...]``.
+
+    Reads return ``TypedScalarValue`` with the array's declared dim
+    tuple as the ExprType's Tensor leaf (so verification through
+    intermediate threadgroup-scratch still sees a sensible expression).
+    Writes pass straight through. No coverage tracking on writes —
+    threadgroup memory is per-kernel scratch, not user-visible output.
+
+    Also supports being wrapped as an MPP ``tensor`` (via ``skv.tensor``)
+    so cooperative-tensor ``.store(tg_view.slice(...))`` continues to
+    work on typed threadgroup arrays.
+    """
+
+    __slots__ = ("_tg", "_dtype", "_shape", "_dtype_obj")
+
+    def __init__(
+        self,
+        spork_tg : _spork_tracer.ThreadgroupArray,
+        dtype    : dt.Dtype,
+        shape    : tuple,
+    ):
+        self._tg = spork_tg
+        self._dtype = dtype
+        self._shape = shape  # tuple of stile FullDims
+
+    @property
+    def shape(self) -> tuple:
+        return self._shape
+
+    def __getitem__(self, index) -> TypedScalarValue:
+        # Extract spork-side indices, unwrapping typed scalars.
+        if isinstance(index, tuple):
+            spork_idx = tuple(
+                i._tracer if isinstance(i, (TypedScalarValue, TypedScalarTracer)) else i
+                for i in index
+            )
+        else:
+            spork_idx = (
+                index._tracer if isinstance(index, (TypedScalarValue, TypedScalarTracer))
+                else index
+            )
+        spork_val = self._tg[spork_idx]
+        # Type: an element of "this scratch array", carried as a Tensor
+        # leaf whose dims are the array's declared shape.
+        return TypedScalarValue(
+            spork_val,
+            Type(st=(), et=Tensor(dims=self._shape), dt=self._dtype),
+        )
+
+    def __setitem__(self, index, value) -> None:
+        if isinstance(index, tuple):
+            spork_idx = tuple(
+                i._tracer if isinstance(i, (TypedScalarValue, TypedScalarTracer)) else i
+                for i in index
+            )
+        else:
+            spork_idx = (
+                index._tracer if isinstance(index, (TypedScalarValue, TypedScalarTracer))
+                else index
+            )
+        val_expr = (
+            value._tracer if isinstance(value, (TypedScalarValue, TypedScalarTracer))
+            else value
+        )
+        self._tg[spork_idx] = val_expr
+
+    # MPP compatibility — when passed to skv.tensor, expose the same
+    # ``_expr`` and ``_shape`` slots the wrapping code reads from
+    # spork's ``ThreadgroupArray``.
+    @property
+    def _expr(self):
+        return self._tg._expr
+
+
+def threadgroup(dtype : dt.Dtype, shape) -> TypedThreadgroupArray:
+    """
+    Allocate a typed threadgroup-memory array of the given shape.
+
+    Shape is a tuple of stile dims (``skv.dim(name, size)``); the
+    spork side gets the concrete integer sizes.
+    """
+    if isinstance(shape, FullDim):
+        shape = (shape,)
+    elif not isinstance(shape, tuple):
+        shape = tuple(shape)
+    for d in shape:
+        if not isinstance(d, FullDim):
+            raise TypeError(
+                f"skv.threadgroup shape must be a tuple of skv.dim(...), "
+                f"got element {d!r}"
+            )
+    int_shape = tuple(as_int(dim_size(d)) for d in shape)
+    spork_tg = _spork_tracer.threadgroup(dtype, int_shape)
+    return TypedThreadgroupArray(spork_tg, dtype, shape)
+
