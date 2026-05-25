@@ -27,6 +27,7 @@ from ..types import (
     DevicePointerSpec,
     ScalarParamSpec,
     ThreadPositionInGrid,
+    ThreadPositionInThreadgroup,
     ThreadgroupPositionInGrid,
 )
 from ._backend import OutputSpec, TypedDevicePointerSpec, _untyped_pointer_spec
@@ -45,8 +46,9 @@ from .primitives import (
 # Each entry maps the attribute class to its GridAxisInfo "kind"
 # string for the coverage check's enumeration.
 _GRID_ATTR_KINDS = {
-    ThreadgroupPositionInGrid : "tgid",
-    ThreadPositionInGrid      : "gid",
+    ThreadgroupPositionInGrid   : "tgid",
+    ThreadPositionInGrid        : "gid",
+    ThreadPositionInThreadgroup : "tid",
 }
 
 

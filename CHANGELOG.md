@@ -65,7 +65,21 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
-- **`skv.local(dtype, init)`** + ``TypedLocal`` — typed mutable scalar
+- **`skv.if_(predicate)`** + ``TypedPredicate``. ``TypedScalarTracer
+  == int`` (only for bare grid-position / loop-var SymbolicInts —
+  not derived AffineExprs) produces a ``TypedPredicate`` carrying both
+  the spork bool tracer and a stile constraint
+  ``{SymbolicInt name → int value}``. ``skv.if_(predicate)`` is a
+  context manager that pushes the constraint onto
+  ``_active_if_constraints`` and emits the underlying ``sk.if_``;
+  stores recorded inside snapshot the constraint into their
+  ``StoredSlice.constraints``. Coverage enumeration restricts the
+  named SymbolicInt to the constraint value for those stores,
+  enabling patterns like ``with skv.if_(tid.x == 0):`` (thread-0-only
+  writeback) where coverage would otherwise treat every thread as
+  writing.
+- **``ThreadPositionInThreadgroup``** now registered as a ``tid``-kind
+  grid axis (range = ``threadgroup[axis]``).
   locals. ``TypedLocal`` subclasses ``TypedScalarValue`` (inherits
   reads + arithmetic) and adds ``.assign(value)``, ``+=``, ``-=``,
   ``*=``, ``/=``. Underlying spork ``Local`` is what actually mutates;

@@ -586,6 +586,35 @@ class TypedScalarTracer:
     def __neg__(self) -> "TypedScalarTracer":
         return TypedScalarTracer(-self._tracer, -to_affine(self._sym))
 
+    def __eq__(self, other) -> "TypedPredicate":
+        """
+        Equality against a Python int — produces a TypedPredicate that
+        the verifier reads as ``{self._sym → other}`` when restricting
+        coverage enumerations inside ``skv.if_(predicate)`` blocks.
+
+        Only supported when ``self._sym`` is a bare SymbolicInt (a raw
+        grid-position or loop variable). Composite AffineExprs aren't
+        constrainable to a single value by an equality check.
+        """
+        if not isinstance(other, int):
+            raise TypeError(
+                "TypedScalarTracer == only supports comparison against "
+                f"Python int (got {type(other).__name__})"
+            )
+        if not isinstance(self._sym, SymbolicInt):
+            raise TypeError(
+                "TypedScalarTracer == is only allowed on a bare "
+                "grid-position or loop variable (not an AffineExpr "
+                "derived from one)"
+            )
+        return TypedPredicate(
+            spork_cond=(self._tracer == other),
+            constraints={self._sym.name: other},
+        )
+
+    def __hash__(self):  # keep instances hashable after overriding __eq__
+        return id(self)
+
 
 class TypedVectorTracer:
     """
@@ -1109,6 +1138,80 @@ class TypedThreadgroupArray:
     @property
     def _expr(self):
         return self._tg._expr
+
+
+class TypedPredicate:
+    """
+    A typed boolean condition. Carries:
+      - ``spork_cond``: the underlying spork bool Tracer (for code emission)
+      - ``constraints``: ``{SymbolicInt name → int value}`` derived from
+        an equality check (only kind supported for now). The verifier
+        uses this to restrict coverage enumeration inside the matching
+        ``skv.if_`` block.
+    """
+
+    __slots__ = ("_spork_cond", "_constraints")
+
+    def __init__(self, spork_cond, constraints : dict):
+        self._spork_cond = spork_cond
+        self._constraints = dict(constraints)
+
+
+class _TypedIfBlock:
+    """
+    Context manager produced by ``skv.if_(predicate)``. Pushes the
+    predicate's constraints onto ``_active_if_constraints`` so any
+    typed stores recorded inside the block snapshot them. On exit,
+    pops the frame and finalizes the spork-side if-block.
+    """
+
+    __slots__ = ("_predicate", "_spork_if", "_spork_if_ctx")
+
+    def __init__(self, predicate : TypedPredicate):
+        self._predicate = predicate
+        self._spork_if = None
+        self._spork_if_ctx = None
+
+    def __enter__(self):
+        # Push the verifier-side constraint frame first.
+        _coverage._active_if_constraints.append(dict(self._predicate._constraints))
+        # Then enter spork's sk.if_ so kernel-body emission goes
+        # inside the then-block scope.
+        self._spork_if = _spork_tracer.if_(self._predicate._spork_cond)
+        self._spork_if_ctx = self._spork_if.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # Close spork's if-block first (so stmts get wrapped), then
+        # pop our verifier frame so subsequent code sees the right
+        # constraint stack.
+        try:
+            self._spork_if.__exit__(exc_type, exc, tb)
+        finally:
+            _coverage._active_if_constraints.pop()
+        return False
+
+
+def if_(predicate : TypedPredicate) -> _TypedIfBlock:
+    """
+    Verified ``with`` block gated by ``predicate``. Inside the block,
+    typed stores have the predicate's constraints attached, so the
+    coverage check substitutes them appropriately (e.g.
+    ``skv.if_(tid.x == 0)`` enumerates only ``tid.x = 0`` for stores
+    inside).
+
+    Usage::
+
+        with skv.if_(tid.x == 0):
+            out[i, d] = scratch[i, d]
+    """
+    if not isinstance(predicate, TypedPredicate):
+        raise TypeError(
+            "skv.if_ expects a TypedPredicate (e.g. from "
+            "`typed_scalar == int`); got "
+            f"{type(predicate).__name__}"
+        )
+    return _TypedIfBlock(predicate)
 
 
 def threadgroup(dtype : dt.Dtype, shape) -> TypedThreadgroupArray:

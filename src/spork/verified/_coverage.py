@@ -40,10 +40,27 @@ class GridAxisInfo:
                 f"GridAxisInfo: axis {self.axis} out of range for grid {grid!r}"
             )
         if self.kind == "tgid":
-            return list(__builtins__["range"](int(grid[self.axis]))) if False else list(range(int(grid[self.axis])))
+            return list(range(int(grid[self.axis])))
         if self.kind == "gid":
             return list(range(int(grid[self.axis]) * int(threadgroup[self.axis])))
+        if self.kind == "tid":
+            return list(range(int(threadgroup[self.axis])))
         raise ValueError(f"Unknown GridAxisInfo kind {self.kind!r}")
+
+
+@dataclass
+class StoredSlice:
+    """
+    One recorded write to the verified output. ``sliced_shape`` is the
+    destination's per-axis Sliced/FullDim dims (as captured by the typed
+    setitem or coop.store path). ``constraints`` records the
+    ``{SymbolicInt name → int value}`` set that was active when this
+    store happened — i.e. ``skv.if_(typed_scalar == value)`` blocks
+    that gated the store. Coverage enumeration uses these to restrict
+    substitutions for that store.
+    """
+    sliced_shape : tuple
+    constraints  : dict = field(default_factory=dict)
 
 
 @dataclass
@@ -64,8 +81,8 @@ class VerifiedKernelState:
     """
     output_ptr_name : Optional[str] = None
     output_shape   : ShapeType = ()
-    stored_slices  : List[Tuple] = field(default_factory=list)
-    pid_axes       : dict = field(default_factory=dict)  # name → GridAxisInfo
+    stored_slices  : List[StoredSlice] = field(default_factory=list)
+    pid_axes       : dict = field(default_factory=dict)
     loop_var_ranges : dict = field(default_factory=dict)
 
 
@@ -101,6 +118,20 @@ class ActiveLoop:
 # popped on body exit; the ``primitives`` module consults this for
 # accumulator snapshotting.
 _active_loops : List[ActiveLoop] = []
+
+
+# Stack of active ``skv.if_(predicate)`` constraint dicts. Each entry
+# is a ``{SymbolicInt name → int value}`` map gated by the if-block.
+# Stores made inside one or more if-blocks snapshot the union of the
+# stack into their StoredSlice.constraints for the coverage check.
+_active_if_constraints : List[dict] = []
+
+
+def _current_if_constraints() -> dict:
+    merged : dict = {}
+    for frame in _active_if_constraints:
+        merged.update(frame)
+    return merged
 
 
 def on_coop_touched(coop) -> None:
@@ -143,10 +174,10 @@ def wrap_loop_accumulators(loop : ActiveLoop) -> None:
 
 def record_store(output_handle, sliced_shape : ShapeType) -> None:
     """
-    Called by ``coop.store(out_tile)`` / ``TypedTensorHandle.assign(...)``
-    when the destination is the verified output. Appends the destination's
-    ShapeType (a tuple of Sliced / FullDim dims) to the active state's
-    stored_slices list.
+    Called by ``coop.store(out_tile)`` / ``TypedTensorHandle.assign(...)`` /
+    typed ``__setitem__`` when the destination is the verified output.
+    Appends a ``StoredSlice`` (destination shape + any active
+    ``skv.if_`` constraints) to the active state's stored_slices list.
     """
     state = _active_state.get()
     if state is None:
@@ -155,7 +186,10 @@ def record_store(output_handle, sliced_shape : ShapeType) -> None:
         return
     if state.output_ptr_name is None:
         return
-    state.stored_slices.append(tuple(sliced_shape))
+    state.stored_slices.append(StoredSlice(
+        sliced_shape=tuple(sliced_shape),
+        constraints=_current_if_constraints(),
+    ))
 
 
 def check_coverage(
@@ -181,7 +215,8 @@ def check_coverage(
         _dim_name(d) : [] for d in state.output_shape
     }
 
-    for sliced_tuple in state.stored_slices:
+    for stored in state.stored_slices:
+        sliced_tuple = stored.sliced_shape
         # Collect SymbolicInts appearing across this store's bounds
         # (FullDim has none; only Sliced bounds can be symbolic).
         atoms : set[SymbolicInt] = set()
@@ -194,10 +229,12 @@ def check_coverage(
                 for atom, _ in to_affine(bound).terms:
                     atoms.add(atom)
 
-        # Enumerate all (SymbolicInt → int) substitutions over their
-        # registered grid ranges. If any atom isn't registered, skip
-        # this store (treat as opaque-fully-covered).
-        substitutions = _enumerate_substitutions(atoms, state, grid, threadgroup)
+        # Enumerate substitutions, restricted by any active-if
+        # constraints recorded at the time of the store.
+        substitutions = _enumerate_substitutions(
+            atoms, state, grid, threadgroup,
+            constraints=stored.constraints,
+        )
         if substitutions is None:
             continue
 
@@ -239,6 +276,12 @@ def check_coverage(
                 "Either widen the output-tile slice bounds or adjust "
                 "the grid so every position is written exactly once."
             )
+        # Note: this only catches UNDER-coverage. Over-coverage
+        # (overlapping writes from multiple threads) is harder to
+        # detect with per-axis intervals alone, since for multi-axis
+        # tile stores the per-axis sums naturally exceed the axis size
+        # via differentiation on other axes. Proper overlap detection
+        # would need N-D rectangle disjointness — a follow-up.
 
 
 def _enumerate_substitutions(
@@ -246,22 +289,25 @@ def _enumerate_substitutions(
     state : "VerifiedKernelState",
     grid : tuple,
     threadgroup : tuple,
+    constraints : "Optional[dict]" = None,
 ) -> "Optional[list[dict]]":
     """
-    Cartesian product of values for each known SymbolicInt: grid
-    SymbolicInts use their ``GridAxisInfo`` (which knows whether to
-    iterate over ``grid[axis]`` for tgid-style or ``grid[axis] *
-    threadgroup[axis]`` for thread_position_in_grid-style);
-    runtime-loop SymbolicInts iterate over their declared
-    ``(lo, hi, step)``. Returns None if any atom isn't registered.
+    Cartesian product of values for each known SymbolicInt. If
+    ``constraints`` restricts a SymbolicInt name to a specific int
+    (e.g. from an enclosing ``skv.if_(tid.x == 0)``), use only that
+    value instead of enumerating the full range. Returns None if any
+    atom is unknown.
     """
     if not atoms:
         return [{}]
+    constraints = constraints or {}
     sorted_atoms = sorted(atoms, key=lambda a: a.name)
     results : list[dict] = [{}]
     for atom in sorted_atoms:
         name = atom.name
-        if name in state.pid_axes:
+        if name in constraints:
+            values = [int(constraints[name])]
+        elif name in state.pid_axes:
             info = state.pid_axes[name]
             try:
                 values = info.iter_values(grid, threadgroup)

@@ -491,3 +491,40 @@ def test_verified_typed_threadgroup_array():
         threadgroup=(TGROUP, 1, 1),
     )(C_arr, A_arr, B_arr)
     np.testing.assert_allclose(C_arr, A_arr + B_arr)
+
+
+def test_verified_if_thread_zero_write_pattern():
+    """
+    A common GQA-style pattern: each threadgroup's thread 0 does the
+    writeback for its tile. Without skv.if_, coverage would (a) fail
+    because the per-thread enumeration of tid would expect ALL threads
+    to participate, OR (b) silently miscount. With skv.if_(tid.x == 0),
+    coverage restricts tid.x to 0 for stores inside the block, so the
+    per-axis intervals reflect the gated execution correctly.
+    """
+    TGROUP = 32
+    TILE = 4
+    N_size = 16  # 4 threadgroups × 4 elements/tile
+    N = skv.dim('N', N_size)
+
+    @skv.jit(out_spec=skv.OutputSpec("(N + N -> N)", st=(N,)))
+    def add_thread0_writes(
+        out : skv.DevicePointer[sk.dt.float32, (N,)],
+        A   : skv.DevicePointer[sk.dt.float32, (N,)],
+        B   : skv.DevicePointer[sk.dt.float32, (N,)],
+        bid : sk.Uint2[sk.ThreadgroupPositionInGrid],
+        tid : sk.Uint2[sk.ThreadPositionInThreadgroup],
+    ):
+        with skv.if_(tid.x == 0):
+            for i in skv.range(TILE):
+                out[bid.x * TILE + i] = A[bid.x * TILE + i] + B[bid.x * TILE + i]
+
+    np.random.seed(0)
+    A_arr = np.random.randn(N_size).astype(np.float32)
+    B_arr = np.random.randn(N_size).astype(np.float32)
+    C_arr = np.zeros(N_size, dtype=np.float32)
+    add_thread0_writes.bind(
+        grid=(N_size // TILE, 1, 1),
+        threadgroup=(TGROUP, 1, 1),
+    )(C_arr, A_arr, B_arr)
+    np.testing.assert_allclose(C_arr, A_arr + B_arr)
