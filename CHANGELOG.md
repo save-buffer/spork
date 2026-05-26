@@ -65,6 +65,22 @@ clear ``does not match spec`` error.
   stile.scope():`` (new stile-0.1.3 API) so dim/tensor registries don't
   collide across tests.
 
+- **`skv.maximum(a, b)`** — typed binary max on ``TypedScalarValue``;
+  ExprType wrapped as ``BinaryOp("max", a_et, b_et)``.
+- **`skv.with_type(handle, spec_str, st, dtype=None)`** — "trust-me"
+  escape hatch that overrides a handle's stile ``Type`` by parsing a
+  spec string. Used when part of a computation is opaque to the
+  verifier (e.g. a threadgroup-memory softmax built from raw loops);
+  the user asserts the result's symbolic type. Downstream typed ops
+  compose against the assumed type.
+- **`spork.verified.kernels.attention(qctx, nctx, dhead)`** — verified
+  non-causal attention against the canonical stile spec
+  ``(softmax[nctx]((qctx dhead, nctx dhead -> qctx nctx) / sqrt(D)),
+  nctx dhead -> qctx dhead)``. Uses MPP ``matmul2d`` for Q@K^T and P@V
+  (verified end-to-end), with a thread-0 softmax on threadgroup-memory
+  scratch (currently trust-me'd via ``with_type``; tile-level typed
+  reductions to verify the softmax body itself are a follow-up).
+
 - **`skv.if_(predicate)`** + ``TypedPredicate``. ``TypedScalarTracer
   == int`` (only for bare grid-position / loop-var SymbolicInts —
   not derived AffineExprs) produces a ``TypedPredicate`` carrying both

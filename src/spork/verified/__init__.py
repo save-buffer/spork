@@ -60,11 +60,13 @@ from .primitives import (
     if_,
     local,
     matmul2d,
+    maximum,
     range,
     sin,
     sqrt,
     tensor,
     threadgroup,
+    with_type,
 )
 
 
@@ -82,6 +84,7 @@ __all__ = [
     "local", "TypedLocal",
     "threadgroup", "TypedThreadgroupArray",
     "if_", "TypedPredicate",
+    "maximum", "with_type",
     "TypedTensorHandle",
     "TypedTileSlice",
     "TypedMatmulOp",

@@ -528,3 +528,31 @@ def test_verified_if_thread_zero_write_pattern():
         threadgroup=(TGROUP, 1, 1),
     )(C_arr, A_arr, B_arr)
     np.testing.assert_allclose(C_arr, A_arr + B_arr)
+
+
+def test_skv_kernels_attention():
+    """
+    Verified non-causal attention via spork.verified.kernels.attention.
+    The kernel uses MPP matmul2d for Q@K^T and P@V, a thread-0 softmax
+    on threadgroup-memory scratch, and skv.with_type to assert the
+    post-softmax tile carries the canonical softmax(QK/sqrt(D)) type
+    before the second MPP matmul composes against the spec.
+    """
+    import spork.verified.kernels as skvk
+
+    Q_size = N_size = D_size = 64
+    np.random.seed(0)
+    Q = np.random.randn(Q_size, D_size).astype(np.float32)
+    K = np.random.randn(N_size, D_size).astype(np.float32)
+    V = np.random.randn(N_size, D_size).astype(np.float32)
+    O = np.zeros((Q_size, D_size), dtype=np.float32)
+
+    qk = Q @ K.T / np.sqrt(D_size)
+    qk = qk - qk.max(axis=-1, keepdims=True)
+    p = np.exp(qk)
+    p = p / p.sum(axis=-1, keepdims=True)
+    expected = p @ V
+
+    attn = skvk.attention(Q_size, N_size, D_size)
+    attn(O, Q, K, V)
+    np.testing.assert_allclose(O, expected, atol=1e-3, rtol=1e-3)

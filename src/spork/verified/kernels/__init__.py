@@ -13,9 +13,11 @@ Currently exported:
     coverage.
 """
 
+from .attention import attention
 from .matmul import matmul
 
 
 __all__ = [
+    "attention",
     "matmul",
 ]

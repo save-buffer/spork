@@ -969,6 +969,75 @@ def cos(x : TypedScalarValue) -> TypedScalarValue:
     return _math_intrinsic(_spork_tracer.cos, "cos", x)
 
 
+def maximum(a, b) -> TypedScalarValue:
+    """
+    Typed binary max on scalar values. Stile ExprType is
+    ``BinaryOp("max", a_et, b_et)``.
+    """
+    a_tracer, a_et = _lower_value(a)
+    b_tracer, b_et = _lower_value(b)
+    new_tracer = _spork_tracer.max(a_tracer, b_tracer)
+    dtype = (
+        a._type.dt if isinstance(a, TypedScalarValue) and a._type.dt is not None
+        else b._type.dt if isinstance(b, TypedScalarValue) and b._type.dt is not None
+        else None
+    )
+    return TypedScalarValue(
+        new_tracer,
+        Type(st=(), et=BinaryOp(op="max", lhs=a_et, rhs=b_et), dt=dtype),
+    )
+
+
+def with_type(
+    handle : "TypedTensorHandle | TypedThreadgroupArray",
+    spec_str : str,
+    st : tuple,
+    dtype : "dt.Dtype | None" = None,
+) -> "TypedTensorHandle":
+    """
+    "Trust-me" escape hatch: assert that a typed tensor handle holds a
+    value of the given parsed spec at the given ShapeType. Useful when
+    a part of the computation is opaque to the verifier (e.g. a
+    threadgroup-memory softmax built from raw spork loops) but the
+    user knows the resulting Type symbolically.
+
+    The verifier doesn't check that the prior writes actually compute
+    this value — that's the user's responsibility. Downstream typed ops
+    compose against this assumed type.
+
+    Returns a new ``TypedTensorHandle`` whose ``_handle`` /
+    ``_ptr`` / ``_is_output`` come from the input; only the stile
+    ``Type`` is replaced.
+    """
+    spec_type = parse_spec_into_type(spec_str)
+    if isinstance(handle, TypedTensorHandle):
+        new_dtype = dtype or handle._type.dt or handle._handle._dtype
+        return TypedTensorHandle(
+            handle=handle._handle,
+            type=Type(st=st, et=spec_type.et, dt=new_dtype),
+            is_output=handle._is_output,
+            ptr=handle._ptr,
+        )
+    if isinstance(handle, TypedThreadgroupArray):
+        # Wrap the threadgroup array as an MPP-style typed handle, so
+        # downstream ops (e.g. matmul slicing) work uniformly.
+        new_dtype = dtype or handle._dtype
+        mpp_handle = _spork_tracer.tensor(
+            handle._tg, new_dtype,
+            tuple(reversed([as_int(dim_size(d)) for d in st])),
+        )
+        return TypedTensorHandle(
+            handle=mpp_handle,
+            type=Type(st=st, et=spec_type.et, dt=new_dtype),
+            is_output=False,
+            ptr=handle._tg,  # ThreadgroupArray, indexable element-wise
+        )
+    raise TypeError(
+        f"skv.with_type expects TypedTensorHandle or TypedThreadgroupArray, "
+        f"got {type(handle).__name__}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Typed mutable local scalars
 # ---------------------------------------------------------------------------
